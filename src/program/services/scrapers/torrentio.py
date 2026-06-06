@@ -141,7 +141,7 @@ class Torrentio(ScraperService[TorrentioConfig]):
 
             stream_title = stream.title.split("\n👤")[0]
             raw_title = stream_title.split("\n")[0]
-            torrents[stream.info_hash] = raw_title
+            torrents[stream.info_hash.lower()] = raw_title
 
         if torrents:
             logger.log(

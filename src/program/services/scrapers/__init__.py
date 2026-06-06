@@ -137,7 +137,9 @@ class Scraping(Runner[ScraperModel, ScraperService[Observable]]):
 
             with results_lock:
                 try:
-                    results.update(service_results)
+                    for infohash, title in service_results.items():
+                        if infohash not in results or len(title) > len(results[infohash]):
+                            results[infohash] = title
                 except Exception as e:
                     logger.exception(
                         f"Error updating results for {svc.__class__.__name__}: {e}"

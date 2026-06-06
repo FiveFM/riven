@@ -153,7 +153,7 @@ class Jackett(ScraperService[JackettConfig]):
                     thread_name_prefix="JackettHashExtract", max_workers=10
                 ) as executor:
                     future_to_result = {
-                        executor.submit(self.get_infohash_from_url, result.link): (
+                        executor.submit(self.get_infohash_from_url, result.link, self.session): (
                             result,
                             title,
                         )

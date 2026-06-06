@@ -74,7 +74,7 @@ class ScraperService(Runner[T, "ScraperService", dict[str, str]]):
         return identifier, scrape_type, imdb_id
 
     @staticmethod
-    def get_infohash_from_url(url: str) -> str | None:
+    def get_infohash_from_url(url: str, session: SmartSession | None = None) -> str | None:
         """
         Get infohash from a URL that could be:
         1. A direct torrent file download
@@ -86,7 +86,7 @@ class ScraperService(Runner[T, "ScraperService", dict[str, str]]):
         if not url:
             return None
 
-        session = SmartSession()
+        session = session or SmartSession()
         try:
             # Try to download with redirects disabled to check for magnet redirects
             r = session.get(url, allow_redirects=False)
