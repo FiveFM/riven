@@ -7,7 +7,7 @@ from program.media.item import MediaItem, Movie
 from program.services.scrapers.base import ScraperService
 from program.settings import settings_manager
 from program.settings.models import RarbgConfig
-from program.utils.request import SmartSession, get_hostname_from_url
+from program.utils.request import CircuitBreakerOpen, SmartSession, get_hostname_from_url
 
 
 class RarbgScrapeResponse(BaseModel):
@@ -78,6 +78,8 @@ class Rarbg(ScraperService[RarbgConfig]):
 
         try:
             return self.scrape(item)
+        except CircuitBreakerOpen:
+            logger.debug(f"Circuit breaker OPEN for TheRARBG; skipping {item.log_string}")
         except Exception as e:
             if "rate limit" in str(e).lower() or "429" in str(e):
                 logger.debug(

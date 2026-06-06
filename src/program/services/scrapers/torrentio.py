@@ -8,7 +8,7 @@ from program.media.item import MediaItem
 from program.services.scrapers.base import ScraperService
 from program.settings import settings_manager
 from program.settings.models import TorrentioConfig
-from program.utils.request import SmartSession
+from program.utils.request import CircuitBreakerOpen, SmartSession
 
 
 class TorrentioScrapeResponse(BaseModel):
@@ -92,6 +92,8 @@ class Torrentio(ScraperService[TorrentioConfig]):
                 logger.error(
                     f"Torrentio HTTP error for {item.log_string}: {str(http_err)}"
                 )
+        except CircuitBreakerOpen:
+            logger.debug(f"Circuit breaker OPEN for Torrentio; skipping {item.log_string}")
         except Exception as e:
             logger.exception(f"Torrentio exception thrown: {str(e)}")
 

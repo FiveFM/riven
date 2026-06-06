@@ -7,7 +7,7 @@ from program.media.item import Episode, MediaItem
 from program.services.scrapers.base import ScraperService
 from program.settings import settings_manager
 from program.settings.models import AppModel, MediafusionConfig
-from program.utils.request import SmartSession, get_hostname_from_url
+from program.utils.request import CircuitBreakerOpen, SmartSession, get_hostname_from_url
 
 
 class MediaFusionEncryptUserDataResponse(BaseModel):
@@ -128,6 +128,8 @@ class Mediafusion(ScraperService[MediafusionConfig]):
 
         try:
             return self.scrape(item)
+        except CircuitBreakerOpen:
+            logger.debug(f"Circuit breaker OPEN for Mediafusion; skipping {item.log_string}")
         except Exception as e:
             if "rate limit" in str(e).lower() or "429" in str(e):
                 logger.debug(
