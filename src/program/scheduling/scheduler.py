@@ -8,6 +8,7 @@ for content services and item-specific schedules.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, TypedDict
 
@@ -46,6 +47,10 @@ class ProgramScheduler:
     def __init__(self, program: "Program") -> None:
         self.program = program
         self.scheduler = BackgroundScheduler()
+        self._reindex_executor = ThreadPoolExecutor(
+            max_workers=3,
+            thread_name_prefix="Reindex_",
+        )
 
     def start(self) -> None:
         """Create and start the background scheduler with all jobs registered."""
@@ -59,6 +64,8 @@ class ProgramScheduler:
 
         if self.scheduler and self.scheduler.running:
             self.scheduler.shutdown(wait=False)
+
+        self._reindex_executor.shutdown(wait=False)
 
     def _schedule_functions(self) -> None:
         """Register internal periodic functions and maintenance tasks."""
@@ -247,7 +254,7 @@ class ProgramScheduler:
                 return
 
             if task.task_type in ("reindex_show", "reindex", "reindex_movie"):
-                self._run_reindex_for_item(session, item)
+                self._run_reindex_for_item(item)
             else:
                 self._enqueue_item_if_needed(session, item)
 
@@ -279,20 +286,28 @@ class ProgramScheduler:
 
         return session.merge(item)
 
-    def _run_reindex_for_item(self, session: Session, item: MediaItem) -> None:
-        """Run indexer service for an item if available and persist updates."""
+    def _run_reindex_for_item(self, item: MediaItem) -> None:
+        """Submit reindex work to the background executor so APScheduler is not blocked."""
 
         assert self.program.services, "Services not initialized in Program"
 
+        item_id = item.id
+        item_log = item.log_string
         indexer_service = self.program.services.indexer
 
-        updated = next(indexer_service.run(item, log_msg=False), None)
+        def _do_reindex() -> None:
+            with db_session() as s:
+                fresh = db_functions.get_item_by_id(item_id, session=s)
+                if not fresh:
+                    return
+                fresh = s.merge(fresh)
+                updated = next(indexer_service.run(fresh, log_msg=False), None)
+                if updated:
+                    s.merge(updated.media_items[0])
+                    s.commit()
+                    logger.info(f"Reindexed {item_log} from scheduler")
 
-        if updated:
-            session.merge(updated.media_items[0])
-            session.commit()
-
-            logger.info(f"Reindexed {item.log_string} from scheduler")
+        self._reindex_executor.submit(_do_reindex)
 
     def _enqueue_item_if_needed(self, session: Session, item: MediaItem) -> None:
         """Refresh state and enqueue item to the event manager if not completed."""

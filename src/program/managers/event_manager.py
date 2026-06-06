@@ -6,7 +6,7 @@ import traceback
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from queue import Empty
-from threading import Lock
+from threading import Lock, RLock
 from typing import TYPE_CHECKING
 
 import sqlalchemy.orm
@@ -61,7 +61,7 @@ class EventManager:
         self._futures = list[FutureWithEvent]()
         self._queued_events = list[Event]()
         self._running_events = list[Event]()
-        self.mutex = Lock()
+        self.mutex = RLock()
 
     def _find_or_create_executor(self, service_cls: Service) -> ThreadPoolExecutor:
         """
@@ -289,6 +289,12 @@ class EventManager:
         self.remove_id_from_queue(item_id)
         self.remove_id_from_running(item_id)
 
+    def shutdown(self, wait: bool = True) -> None:
+        """Shut down all service executors, optionally waiting for in-flight jobs."""
+
+        for service_executor in self._executors:
+            service_executor.executor.shutdown(wait=wait, cancel_futures=not wait)
+
     def submit_job(
         self,
         service: Service,
@@ -336,6 +342,9 @@ class EventManager:
         )
 
         self._futures.append(future_with_event)
+
+        if event and event.item_id:
+            self.add_event_to_running(event)
 
         sse_manager.publish_event(
             "event_update",
@@ -505,45 +514,46 @@ class EventManager:
             if event.item_id:
                 item_id, related_ids = db_functions.get_item_ids(session, event.item_id)
 
-        if item_id:
-            if self._id_in_queue(item_id):
-                logger.debug(f"Item ID {item_id} is already in the queue, skipping.")
-                return False
+        with self.mutex:
+            if item_id:
+                if self._id_in_queue(item_id):
+                    logger.debug(f"Item ID {item_id} is already in the queue, skipping.")
+                    return False
 
-            if self._id_in_running_events(item_id):
-                logger.debug(f"Item ID {item_id} is already running, skipping.")
-                return False
+                if self._id_in_running_events(item_id):
+                    logger.debug(f"Item ID {item_id} is already running, skipping.")
+                    return False
 
-            for related_id in related_ids:
-                if self._id_in_queue(related_id) or self._id_in_running_events(
-                    related_id
+                for related_id in related_ids:
+                    if self._id_in_queue(related_id) or self._id_in_running_events(
+                        related_id
+                    ):
+                        logger.debug(
+                            f"Child of Item ID {item_id} is already in the queue or running, skipping."
+                        )
+
+                        return False
+            else:
+                # Content-only
+                if (content_item := event.content_item) is None:
+                    logger.debug("Event has neither item_id nor content_item; skipping.")
+                    return False
+
+                # Single-pass checks: queued and running
+                if self.item_exists_in_queue(
+                    content_item,
+                    self._queued_events,
+                ) or self.item_exists_in_queue(
+                    content_item,
+                    self._running_events,
                 ):
                     logger.debug(
-                        f"Child of Item ID {item_id} is already in the queue or running, skipping."
+                        f"Content Item with {content_item.log_string} is already queued or running, skipping."
                     )
 
                     return False
-        else:
-            # Content-only
-            if (content_item := event.content_item) is None:
-                logger.debug("Event has neither item_id nor content_item; skipping.")
-                return False
 
-            # Single-pass checks: queued and running
-            if self.item_exists_in_queue(
-                content_item,
-                self._queued_events,
-            ) or self.item_exists_in_queue(
-                content_item,
-                self._running_events,
-            ):
-                logger.debug(
-                    f"Content Item with {content_item.log_string} is already queued or running, skipping."
-                )
-
-                return False
-
-        self.add_event_to_queue(event)
+            self.add_event_to_queue(event)
 
         return True
 
