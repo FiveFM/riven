@@ -56,11 +56,23 @@ class EventManager:
     Manages the execution of services and the handling of events.
     """
 
+    _STATE_PRIORITY: dict[States, int] = {
+        States.Completed: 0,
+        States.Symlinked: 1,
+        States.Downloaded: 2,
+        States.Scraped: 3,
+        States.PartiallyCompleted: 4,
+        States.Indexed: 5,
+    }
+
     def __init__(self):
         self._executors = list[ServiceExecutor]()
         self._futures = list[FutureWithEvent]()
         self._queued_events = list[Event]()
         self._running_events = list[Event]()
+        # Parallel sets for O(1) membership checks on item_id
+        self._queued_item_ids: set[int] = set()
+        self._running_item_ids: set[int] = set()
         self.mutex = RLock()
 
     def _find_or_create_executor(self, service_cls: Service) -> ThreadPoolExecutor:
@@ -213,6 +225,8 @@ class EventManager:
                             event.item_state = item.last_state
 
             self._queued_events.append(event)
+            if event.item_id:
+                self._queued_item_ids.add(event.item_id)
 
             if log_message:
                 logger.debug(f"Added {event.log_message} to the queue.")
@@ -227,6 +241,8 @@ class EventManager:
 
         with self.mutex:
             self._queued_events.remove(event)
+            if event.item_id:
+                self._queued_item_ids.discard(event.item_id)
             logger.debug(f"Removed {event.log_message} from the queue.")
 
     def remove_event_from_running(self, event: Event):
@@ -240,6 +256,8 @@ class EventManager:
         with self.mutex:
             if event in self._running_events:
                 self._running_events.remove(event)
+                if event.item_id:
+                    self._running_item_ids.discard(event.item_id)
                 logger.debug(f"Removed {event.log_message} from running events.")
 
     def remove_id_from_queue(self, item_id: int):
@@ -264,6 +282,8 @@ class EventManager:
 
         with self.mutex:
             self._running_events.append(event)
+            if event.item_id:
+                self._running_item_ids.add(event.item_id)
             logger.debug(f"Added {event.log_message} to running events.")
 
     def remove_id_from_running(self, item_id: int):
@@ -434,27 +454,9 @@ class EventManager:
                     if not ready_events:
                         raise Empty
 
-                    # Define state priority (lower number = higher priority).
-                    # Items closest to completion are processed first.
-                    state_priority = dict[States, int](
-                        {
-                            States.Completed: 0,
-                            States.Symlinked: 1,
-                            States.Downloaded: 2,
-                            States.Scraped: 3,
-                            States.PartiallyCompleted: 4,
-                            States.Indexed: 5,
-                        }
-                    )
-
                     def get_event_priority(event: Event) -> tuple[int, datetime]:
-                        """
-                        Returns a tuple for sorting: (state_priority, run_at)
-                        Uses cached item_state to avoid database queries.
-                        """
                         if event.item_state:
-                            priority = state_priority.get(event.item_state, 999)
-                            return (priority, event.run_at)
+                            return (self._STATE_PRIORITY.get(event.item_state, 999), event.run_at)
                         return (0, event.run_at)
 
                     # Sort by priority (state first, then run_at)
@@ -478,7 +480,7 @@ class EventManager:
             bool: True if the item is in the queue, False otherwise.
         """
 
-        return any(event.item_id == _id for event in self._queued_events)
+        return _id in self._queued_item_ids
 
     def _id_in_running_events(self, _id: int) -> bool:
         """
@@ -491,7 +493,7 @@ class EventManager:
             bool: True if the item is in the running events, False otherwise.
         """
 
-        return any(event.item_id == _id for event in self._running_events)
+        return _id in self._running_item_ids
 
     def add_event(self, event: Event) -> bool:
         """
@@ -510,8 +512,8 @@ class EventManager:
         related_ids = []
 
         # Check if the event's item is a show and its seasons or episodes are in the queue or running
-        with db_session() as session:
-            if event.item_id:
+        if event.item_id:
+            with db_session() as session:
                 item_id, related_ids = db_functions.get_item_ids(session, event.item_id)
 
         with self.mutex:

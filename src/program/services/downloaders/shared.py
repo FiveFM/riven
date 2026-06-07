@@ -177,8 +177,7 @@ RESOLUTION_MAP = dict[str, Resolution](
 
 def get_resolution(torrent: Stream) -> Resolution:
     """Get the resolution of a torrent."""
-    resolution = torrent.resolution.lower() if torrent.resolution else "unknown"
-    return RESOLUTION_MAP.get(resolution, Resolution.UNKNOWN)
+    return RESOLUTION_MAP.get(torrent.resolution or "unknown", Resolution.UNKNOWN)
 
 
 def sort_streams_by_quality(streams: list[Stream]) -> list[Stream]:

@@ -154,6 +154,7 @@ class MediaItem(MappedAsDataclass, Base, kw_only=True):
         Index("ix_mediaitem_rating", "rating"),
         Index("ix_mediaitem_content_rating", "content_rating"),
         Index("ix_mediaitem_overseerr_id", "overseerr_id"),
+        Index("ix_mediaitem_last_state", "last_state"),
         Index("ix_mediaitem_type_aired_at", "type", "aired_at"),  # Composite index
     )
 
@@ -418,15 +419,12 @@ class MediaItem(MappedAsDataclass, Base, kw_only=True):
         """Check if the item has been scraped."""
 
         try:
-            has_streams = len(self.streams) > 0
-            if not has_streams:
+            if not self.streams:
                 return False
 
-            return any(
-                stream not in self.blacklisted_streams for stream in self.streams
-            )
+            blacklisted = {s.infohash for s in self.blacklisted_streams}
+            return any(s.infohash not in blacklisted for s in self.streams)
         except DetachedInstanceError:
-            # If detached, we can only return true if the relationship was already loaded
             return False
         except Exception as e:
             logger.error(f"Error in is_scraped for {self.log_string}: {e}")
@@ -980,7 +978,7 @@ class Season(MediaItem):
         sqlalchemy.Integer,
     )
     parent_id: Mapped[int] = mapped_column(
-        sqlalchemy.ForeignKey("Show.id", ondelete="CASCADE"), use_existing_column=True
+        sqlalchemy.ForeignKey("Show.id", ondelete="CASCADE"), use_existing_column=True, index=True
     )
     parent: Mapped["Show"] = relationship(
         lazy="selectin",
@@ -1158,7 +1156,7 @@ class Episode(MediaItem):
     )
     number: Mapped[int]
     parent_id: Mapped[int] = mapped_column(
-        sqlalchemy.ForeignKey("Season.id", ondelete="CASCADE"), use_existing_column=True
+        sqlalchemy.ForeignKey("Season.id", ondelete="CASCADE"), use_existing_column=True, index=True
     )
     parent: Mapped["Season"] = relationship(
         back_populates="episodes",

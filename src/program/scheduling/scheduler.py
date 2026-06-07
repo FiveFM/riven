@@ -170,13 +170,17 @@ class ProgramScheduler:
 
         item_ids = db_functions.retry_library()
 
-        for item_id in item_ids:
-            self.program.em.add_event(Event(emitted_by="RetryLibrary", item_id=item_id))
+        em = self.program.em
+        already_active = em._queued_item_ids | em._running_item_ids
+        pending = [iid for iid in item_ids if iid not in already_active]
 
-        if item_ids:
+        for item_id in pending:
+            em.add_event(Event(emitted_by="RetryLibrary", item_id=item_id))
+
+        if pending:
             logger.log(
                 "PROGRAM",
-                f"Successfully retried {len(item_ids)} incomplete items",
+                f"Successfully retried {len(pending)} incomplete items",
             )
         else:
             logger.log("NOT_FOUND", "No items required retrying")
@@ -381,6 +385,32 @@ class ProgramScheduler:
 
         return existing is not None
 
+    def _get_scheduled_item_ids(
+        self,
+        session: Session,
+        item_ids: list[int],
+        task_type: str,
+        now: datetime,
+    ) -> set[int]:
+        """Return set of item_ids that already have a pending future task of the given type."""
+
+        if not item_ids:
+            return set()
+
+        rows = (
+            session.execute(
+                select(ScheduledTask.item_id)
+                .where(ScheduledTask.item_id.in_(item_ids))
+                .where(ScheduledTask.task_type == task_type)
+                .where(ScheduledTask.status == ScheduledStatus.Pending)
+                .where(ScheduledTask.scheduled_for >= now)
+            )
+            .scalars()
+            .all()
+        )
+
+        return set(rows)
+
     def _schedule_upcoming_episodes(
         self,
         session: Session,
@@ -401,11 +431,12 @@ class ProgramScheduler:
             .all()
         )
 
+        scheduled_ids = self._get_scheduled_item_ids(
+            session, [ep.id for ep in upcoming_eps], "episode_release", now
+        )
+
         for ep in upcoming_eps:
-            if (
-                not self._has_future_task(session, ep.id, "episode_release", now)
-                and ep.aired_at
-            ):
+            if ep.id not in scheduled_ids and ep.aired_at:
                 run_at = ep.aired_at + timedelta(seconds=offset_seconds)
 
                 try:
@@ -434,16 +465,12 @@ class ProgramScheduler:
             .scalars()
             .all()
         )
+        scheduled_ids = self._get_scheduled_item_ids(
+            session, [mv.id for mv in upcoming_movies], "movie_release", now
+        )
+
         for mv in upcoming_movies:
-            if (
-                not self._has_future_task(
-                    session=session,
-                    item_id=mv.id,
-                    task_type="movie_release",
-                    now=now,
-                )
-                and mv.aired_at
-            ):
+            if mv.id not in scheduled_ids and mv.aired_at:
                 run_at = mv.aired_at + timedelta(seconds=offset_seconds)
 
                 try:
@@ -470,22 +497,28 @@ class ProgramScheduler:
             .all()
         )
 
+        scheduled_ids = self._get_scheduled_item_ids(
+            session, [show.id for show in ongoing_shows], "reindex_show", now
+        )
+
         for show in ongoing_shows:
+            if show.id in scheduled_ids:
+                continue
+
             rd = show.release_data
             next_air = self._compute_next_air_datetime(rd, now)
 
             if next_air and next_air > now:
-                if not self._has_future_task(session, show.id, "reindex_show", now):
-                    try:
-                        show.schedule(
-                            next_air,
-                            task_type="reindex_show",
-                            reason="monitor:next_air",
-                        )
-                    except Exception as e:
-                        logger.debug(
-                            f"Skipping reindex schedule for {show.log_string}: {e}"
-                        )
+                try:
+                    show.schedule(
+                        next_air,
+                        task_type="reindex_show",
+                        reason="monitor:next_air",
+                    )
+                except Exception as e:
+                    logger.debug(
+                        f"Skipping reindex schedule for {show.log_string}: {e}"
+                    )
             else:
                 fallback_time = (now + timedelta(days=1)).replace(
                     minute=0,
@@ -493,17 +526,16 @@ class ProgramScheduler:
                     microsecond=0,
                 )
 
-                if not self._has_future_task(session, show.id, "reindex_show", now):
-                    try:
-                        show.schedule(
-                            fallback_time,
-                            task_type="reindex_show",
-                            reason="monitor:fallback_daily",
-                        )
-                    except Exception as e:
-                        logger.debug(
-                            f"Skipping fallback reindex for {show.log_string}: {e}"
-                        )
+                try:
+                    show.schedule(
+                        fallback_time,
+                        task_type="reindex_show",
+                        reason="monitor:fallback_daily",
+                    )
+                except Exception as e:
+                    logger.debug(
+                        f"Skipping fallback reindex for {show.log_string}: {e}"
+                    )
 
     def _schedule_unknown_movies(self, session: Session, now: datetime) -> None:
         """Schedule daily reindex for movies without any known release date."""
@@ -528,12 +560,16 @@ class ProgramScheduler:
             .all()
         )
 
-        for mv in unknown_movies:
-            fallback_time = (now + timedelta(days=1)).replace(
-                minute=0, second=0, microsecond=0
-            )
+        scheduled_ids = self._get_scheduled_item_ids(
+            session, [mv.id for mv in unknown_movies], "reindex_movie", now
+        )
 
-            if not self._has_future_task(session, mv.id, "reindex_movie", now):
+        fallback_time = (now + timedelta(days=1)).replace(
+            minute=0, second=0, microsecond=0
+        )
+
+        for mv in unknown_movies:
+            if mv.id not in scheduled_ids:
                 try:
                     mv.schedule(
                         fallback_time,
