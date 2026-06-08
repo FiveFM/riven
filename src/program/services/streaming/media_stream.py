@@ -350,7 +350,10 @@ class MediaStream:
                                                     else None
                                                 )
                                             ):
-                                                data = await anext(connection.reader)
+                                                try:
+                                                    data = await anext(connection.reader)
+                                                except StopAsyncIteration:
+                                                    raise DebridServiceClosedConnectionException(provider=self.provider)
 
                                             if data == b"":
                                                 raise EmptyDataException(
@@ -970,6 +973,9 @@ class MediaStream:
             except DebridServiceLinkUnavailable:
                 raise
             except Exception as e:
+                if isinstance(e, BaseExceptionGroup) and len(e.exceptions) == 1:
+                    raise e.exceptions[0] from e
+
                 logger.exception(
                     self.build_log_message("Unexpected error connecting to stream")
                 )
