@@ -46,6 +46,90 @@ class TMDBApi:
 
         return FindById200Response.from_dict(response.json())
 
+    # ------------------------------------------------------------------
+    # Browse / discovery endpoints
+    #
+    # These return the raw TMDB JSON payload (a dict) so the frontend can
+    # consume the standard TMDB shape (poster_path, title/name, etc.)
+    # directly. They power the "Discover" browsing UI.
+    # ------------------------------------------------------------------
+
+    def trending(
+        self, media_type: str = "all", window: str = "week", page: int = 1
+    ) -> dict:
+        """Trending movies/tv. media_type: all|movie|tv, window: day|week."""
+
+        response = self.session.get(
+            f"trending/{media_type}/{window}",
+            params={"page": page},
+        )
+
+        return response.json()
+
+    def popular(self, media_type: str, page: int = 1) -> dict:
+        """Popular movies or tv. media_type: movie|tv."""
+
+        response = self.session.get(
+            f"{media_type}/popular",
+            params={"page": page},
+        )
+
+        return response.json()
+
+    def search_multi(self, query: str, page: int = 1) -> dict:
+        """Search across movies and tv (people are filtered out client-side)."""
+
+        response = self.session.get(
+            "search/multi",
+            params={"query": query, "page": page, "include_adult": "false"},
+        )
+
+        return response.json()
+
+    def discover(
+        self,
+        media_type: str,
+        page: int = 1,
+        with_genres: str | None = None,
+        year: int | None = None,
+        sort_by: str | None = None,
+    ) -> dict:
+        """Discover movies or tv with optional genre/year/sort filters."""
+
+        params: dict[str, str | int] = {
+            "page": page,
+            "include_adult": "false",
+        }
+
+        if with_genres:
+            params["with_genres"] = with_genres
+        if sort_by:
+            params["sort_by"] = sort_by
+        if year:
+            # TMDB uses different year params for movie vs tv
+            params["primary_release_year" if media_type == "movie" else "first_air_date_year"] = year
+
+        response = self.session.get(f"discover/{media_type}", params=params)
+
+        return response.json()
+
+    def genres(self, media_type: str) -> dict:
+        """Genre list for movie or tv."""
+
+        response = self.session.get(f"genre/{media_type}/list")
+
+        return response.json()
+
+    def tv_details(self, tv_id: str | int) -> dict:
+        """TV details with external IDs (gives seasons and the TVDB id)."""
+
+        response = self.session.get(
+            f"tv/{tv_id}",
+            params={"append_to_response": "external_ids"},
+        )
+
+        return response.json()
+
     def get_movie_details_with_external_ids_and_release_dates(self, movie_id: str):
         """Get movie details with external IDs and release dates appended"""
 

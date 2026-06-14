@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Any, Generic, Literal, TypeVar, cast
 
 from loguru import logger
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from program.services.downloaders.models import (
     DebridFile,
@@ -120,15 +120,14 @@ class AllDebridMagnetStatusResponse(BaseModel):
 
     magnets: list[MagnetInfo | MagnetErrorInfo]
 
-    @field_validator("magnets", mode="before")
+    @model_validator(mode="before")
     @classmethod
-    def normalize_magnets(cls, v: Any):
-        logger.debug(f"Normalizing magnets field: {v}")
-
-        if isinstance(v, dict):
-            return cast(list[dict[Any, Any]], [v])
-
-        return v
+    def normalize(cls, values: Any) -> Any:
+        if isinstance(values, dict):
+            magnets = values.get("magnets")
+            if isinstance(magnets, dict):
+                values["magnets"] = [magnets]
+        return values
 
 
 class AllDebridError(Exception):
