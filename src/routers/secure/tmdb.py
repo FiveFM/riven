@@ -123,8 +123,8 @@ async def genres(
 
 @router.get(
     "/tv/{tmdb_id}",
-    summary="TV details with seasons and external IDs",
-    description="Returns TV details including seasons and external_ids (TVDB id), used when requesting shows.",
+    summary="TV details with seasons, external IDs, cast and recommendations",
+    description="Returns TV details including seasons, external_ids (TVDB id), credits and recommendations.",
     operation_id="tmdb_tv_details",
 )
 async def tv_details(
@@ -132,5 +132,54 @@ async def tv_details(
 ) -> dict[str, Any]:
     try:
         return tmdb_api.tv_details(tmdb_id)
+    except TMDBApiError as e:
+        raise HTTPException(status_code=502, detail=f"TMDB error: {e}") from e
+
+
+@router.get(
+    "/movie/{tmdb_id}",
+    summary="Movie details with external IDs, cast and recommendations",
+    description="Returns movie details including external_ids, credits, recommendations and belongs_to_collection.",
+    operation_id="tmdb_movie_details",
+)
+async def movie_details(
+    tmdb_id: Annotated[str, Path(description="TMDB movie id")],
+) -> dict[str, Any]:
+    try:
+        return tmdb_api.movie_details(tmdb_id)
+    except TMDBApiError as e:
+        raise HTTPException(status_code=502, detail=f"TMDB error: {e}") from e
+
+
+@router.get(
+    "/collection/{collection_id}",
+    summary="Collection (franchise) details",
+    description="Returns a collection's movie parts — the prequels/sequels of a franchise.",
+    operation_id="tmdb_collection_details",
+)
+async def collection_details(
+    collection_id: Annotated[str, Path(description="TMDB collection id")],
+) -> dict[str, Any]:
+    try:
+        return tmdb_api.collection_details(collection_id)
+    except TMDBApiError as e:
+        raise HTTPException(status_code=502, detail=f"TMDB error: {e}") from e
+
+
+@router.get(
+    "/find/{external_source}/{external_id}",
+    summary="Resolve an external id to TMDB",
+    description="Resolve an external id (e.g. tvdb_id) to its TMDB movie/tv results.",
+    operation_id="tmdb_find",
+)
+async def find(
+    external_source: Annotated[
+        str,
+        Path(description="External source, e.g. tvdb_id, imdb_id"),
+    ],
+    external_id: Annotated[str, Path(description="The external id value")],
+) -> dict[str, Any]:
+    try:
+        return tmdb_api.find(external_source, external_id)
     except TMDBApiError as e:
         raise HTTPException(status_code=502, detail=f"TMDB error: {e}") from e

@@ -121,11 +121,42 @@ class TMDBApi:
         return response.json()
 
     def tv_details(self, tv_id: str | int) -> dict:
-        """TV details with external IDs (gives seasons and the TVDB id)."""
+        """TV details with seasons, external IDs (TVDB id), cast and recommendations."""
 
         response = self.session.get(
             f"tv/{tv_id}",
-            params={"append_to_response": "external_ids"},
+            params={"append_to_response": "external_ids,credits,recommendations"},
+        )
+
+        return response.json()
+
+    def movie_details(self, movie_id: str | int) -> dict:
+        """Movie details with external IDs, cast and recommendations.
+
+        ``belongs_to_collection`` in the payload links to the franchise
+        (prequels/sequels), fetched separately via ``collection_details``.
+        """
+
+        response = self.session.get(
+            f"movie/{movie_id}",
+            params={"append_to_response": "external_ids,credits,recommendations"},
+        )
+
+        return response.json()
+
+    def collection_details(self, collection_id: str | int) -> dict:
+        """Collection (franchise) details, including its movie ``parts``."""
+
+        response = self.session.get(f"collection/{collection_id}")
+
+        return response.json()
+
+    def find(self, external_source: str, external_id: str) -> dict:
+        """Resolve an external id (e.g. tvdb_id) to TMDB results."""
+
+        response = self.session.get(
+            f"find/{external_id}",
+            params={"external_source": external_source},
         )
 
         return response.json()
