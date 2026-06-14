@@ -8,7 +8,7 @@ from program.media.item import Episode, MediaItem, Movie, Season, Show
 from program.services.scrapers.base import ScraperService
 from program.settings import settings_manager
 from program.settings.models import AIOStreamsConfig
-from program.utils.request import SmartSession, get_hostname_from_url
+from program.utils.request import CircuitBreakerOpen, SmartSession, get_hostname_from_url
 
 
 class AIOStreamsSearchResult(BaseModel):
@@ -138,6 +138,8 @@ class AIOStreams(ScraperService[AIOStreamsConfig]):
                 logger.debug(f"AIOStreams rate limit exceeded for item: {item.log_string}")
             else:
                 logger.error(f"AIO HTTP error for {item.log_string}: {http_err!s}")
+        except CircuitBreakerOpen:
+            logger.debug(f"Circuit breaker OPEN for AIOStreams; skipping {item.log_string}")
         except Exception as e:
             logger.exception(f"AIO exception thrown: {e!s}")
 

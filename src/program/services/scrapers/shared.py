@@ -21,6 +21,8 @@ scraping_settings: ScraperModel = settings_manager.settings.scraping
 ranking_settings: RTNSettingsModel = settings_manager.settings.ranking
 ranking_model: BaseRankingModel = DefaultRanking()
 rtn = RTN(ranking_settings, ranking_model)
+# Pre-computed dump of global ranking_settings for cheap equality checks in parse_results
+_ranking_settings_dump: dict = ranking_settings.model_dump()
 
 
 def get_ranking_overrides(
@@ -91,11 +93,9 @@ def parse_results(
 
     # Use effective RTN settings (handles explicit overrides/context implicitly)
     active_settings = settings_manager.get_effective_rtn_model()
-    
-    # Check if we are diverging from the global singleton `rtn` instance
-    is_default_settings = (active_settings.model_dump() == ranking_settings.model_dump())
-    
-    if is_default_settings:
+
+    # Compare against cached dump to avoid two full model_dump() calls per scrape
+    if active_settings.model_dump() == _ranking_settings_dump:
         rtn_instance = rtn
     else:
         rtn_instance = RTN(active_settings, ranking_model)

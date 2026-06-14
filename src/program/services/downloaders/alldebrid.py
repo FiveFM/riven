@@ -370,6 +370,77 @@ class AllDebridDownloader(DownloaderBase):
 
             return None
 
+    def _fetch_magnet_raw(
+        self,
+        torrent_id: int | str,
+    ) -> "AllDebridMagnetStatusResponse.MagnetInfo":
+        """
+        Single v4.1/magnet/status call — shared by _process_torrent and get_torrent_info.
+
+        Raises:
+            AllDebridError: on API or parse failure.
+        """
+
+        assert self.api
+
+        response = self.api.session.post(
+            "v4.1/magnet/status",
+            data={"id": str(torrent_id)},
+        )
+
+        self._maybe_backoff(response)
+
+        if not response.ok:
+            raise AllDebridError(self._handle_error(response))
+
+        data = (
+            AllDebridResponse[AllDebridMagnetStatusResponse]
+            .model_validate({"data": response.json()})
+            .data
+        )
+
+        if isinstance(data, AllDebridErrorResponse):
+            raise AllDebridError(
+                f"Invalid response format from AllDebrid: {data.error.message}"
+            )
+
+        magnets = data.data.magnets
+
+        if not magnets:
+            raise AllDebridError(f"Magnet {torrent_id} not found")
+
+        [magnet_data] = magnets
+
+        if isinstance(magnet_data, AllDebridMagnetStatusResponse.MagnetErrorInfo):
+            raise AllDebridError(
+                f"Error getting magnet info: {magnet_data.error.message}"
+            )
+
+        return magnet_data
+
+    def _files_from_magnet(
+        self,
+        files: "list[AllDebridFile | AllDebridDirectory] | None",
+    ) -> list["AllDebridFile"] | None:
+        """
+        Flatten a magnet's file tree into a list of AllDebridFile objects.
+
+        Handles both flat (single-file torrent) and nested (season pack) structures.
+        """
+
+        if not files:
+            return None
+
+        all_files = list[AllDebridFile]()
+
+        for entry in files:
+            if isinstance(entry, AllDebridFile):
+                all_files.append(entry)
+            else:
+                self._add_link_to_files_recursive(entry.e, "", all_files)
+
+        return all_files or None
+
     def _process_torrent(
         self,
         torrent_id: int,
@@ -383,32 +454,39 @@ class AllDebridDownloader(DownloaderBase):
             (TorrentContainer or None, human-readable reason string if None, TorrentInfo or None)
         """
 
-        info = self.get_torrent_info(torrent_id)
+        magnet_data = self._fetch_magnet_raw(torrent_id)
 
-        if not info:
-            return None, "no torrent info returned by AllDebrid", None
-
-        # Check if torrent is ready (statusCode 4 = Ready)
         # Status codes: 0=In Queue, 1=Downloading, 2=Compressing, 3=Uploading, 4=Ready
-        if info.status != "Ready":
-            return None, f"Not instantly available (status={info.status})", None
+        if magnet_data.status != "Ready":
+            return None, f"Not instantly available (status={magnet_data.status})", None
 
-        # Get files from the magnet/files endpoint
-        files_data = self._get_magnet_files(torrent_id)
+        files_data = self._files_from_magnet(magnet_data.files)
 
         if not files_data:
             return None, "no files present in the torrent", None
 
         files = list[DebridFile]()
-
-        # Process files recursively from the nested structure
-        # files_data is a list of file objects with 'n', 's', 'l', and optionally 'e' fields
         self._extract_files_recursive(files_data, item_type, files, infohash)
 
         if not files:
             return None, "no valid files after validation", None
 
-        # Return container WITH the TorrentInfo to avoid re-fetching in download phase
+        upload_date = magnet_data.upload_date
+        completion_date = magnet_data.completion_date
+
+        info = TorrentInfo(
+            id=torrent_id,
+            name=magnet_data.filename,
+            status=magnet_data.status,
+            infohash=None,
+            bytes=magnet_data.size,
+            created_at=datetime.fromtimestamp(upload_date) if upload_date else None,
+            completed_at=datetime.fromtimestamp(completion_date) if completion_date else None,
+            progress=100.0 if magnet_data.status_code == 4 else 0.0,
+            files={},
+            links=[],
+        )
+
         return TorrentContainer(infohash=infohash, files=files), None, info
 
     def _add_link_to_files_recursive(
@@ -557,81 +635,6 @@ class AllDebridDownloader(DownloaderBase):
 
         pass
 
-    def _get_magnet_files(
-        self,
-        magnet_id: int,
-    ) -> list[AllDebridFile] | None:
-        """
-        Get the files and download links for a magnet.
-
-        Returns:
-            list of file objects with 'n' (name), 's' (size), 'l' (link), and optionally 'e' (entries) fields.
-        """
-
-        try:
-            assert self.api
-
-            # Get the magnet status which includes links
-            response = self.api.session.post(
-                "v4.1/magnet/status",
-                data={
-                    "id": str(magnet_id),
-                },
-            )
-
-            self._maybe_backoff(response)
-
-            if not response.ok:
-                return None
-
-            data = (
-                AllDebridResponse[AllDebridMagnetStatusResponse]
-                .model_validate({"data": response.json()})
-                .data
-            )
-
-            if isinstance(data, AllDebridErrorResponse):
-                return None
-
-            # Get magnets from status response
-            magnets = data.data.magnets
-
-            if not magnets:
-                return None
-
-            for magnet in magnets:
-                # Extract files from links in the status response
-                # Structure: links[].link = download URL, links[].files = file/folder objects
-                # For season packs: links[].files[0].e = array of episode files
-
-                if isinstance(magnet, AllDebridMagnetStatusResponse.MagnetErrorInfo):
-                    continue  # Skip errored magnets
-
-                files = magnet.files
-
-                if files:
-                    all_files = list[AllDebridFile]()
-
-                    for file_or_directory in files:
-                        download_link = ""
-
-                        if isinstance(file_or_directory, AllDebridFile):
-                            download_link = file_or_directory.l
-                        else:
-                            # Recursively process files/folders and add download link
-                            self._add_link_to_files_recursive(
-                                file_or_directory.e, download_link, all_files
-                            )
-
-                    if all_files:
-                        return all_files
-
-                return None
-
-        except Exception as e:
-            logger.debug(f"Error getting magnet files: {e}")
-            return None
-
     def get_torrent_info(self, torrent_id: int | str) -> TorrentInfo:
         """
         Get information about a specific magnet using its ID.
@@ -647,67 +650,23 @@ class AllDebridDownloader(DownloaderBase):
             AllDebridError: If the API returns a failing status.
         """
 
-        assert self.api
+        magnet_data = self._fetch_magnet_raw(torrent_id)
 
-        # AllDebrid API expects ID as string
-        response = self.api.session.post(
-            "v4.1/magnet/status",
-            data={
-                "id": str(torrent_id),
-            },
-        )
-
-        self._maybe_backoff(response)
-
-        if not response.ok:
-            raise AllDebridError(self._handle_error(response))
-
-        data = (
-            AllDebridResponse[AllDebridMagnetStatusResponse]
-            .model_validate({"data": response.json()})
-            .data
-        )
-
-        if isinstance(data, AllDebridErrorResponse):
-            raise AllDebridError(
-                f"Invalid response format from AllDebrid: {data.error.message}"
-            )
-
-        magnets = data.data.magnets
-
-        if not magnets:
-            raise AllDebridError(f"Magnet {torrent_id} not found")
-
-        # Handle both list and single SimpleNamespace object
-        [magnet_data] = magnets
-
-        if isinstance(magnet_data, AllDebridMagnetStatusResponse.MagnetErrorInfo):
-            raise AllDebridError(
-                f"Error getting magnet info: {magnet_data.error.message}"
-            )
-
-        # Map AllDebrid status codes to status strings
-        status = magnet_data.status
-
-        # Parse timestamps
         upload_date = magnet_data.upload_date
         completion_date = magnet_data.completion_date
-
-        created_at = datetime.fromtimestamp(upload_date) if upload_date else None
-        completed_at = (
-            datetime.fromtimestamp(completion_date) if completion_date else None
-        )
 
         return TorrentInfo(
             id=torrent_id,
             name=magnet_data.filename,
-            status=status,
-            infohash=None,  # AllDebrid doesn't return infohash in status
+            status=magnet_data.status,
+            infohash=None,
             bytes=magnet_data.size,
-            created_at=created_at,
-            completed_at=completed_at,
+            created_at=datetime.fromtimestamp(upload_date) if upload_date else None,
+            completed_at=(
+                datetime.fromtimestamp(completion_date) if completion_date else None
+            ),
             progress=100.0 if magnet_data.status_code == 4 else 0.0,
-            files={},  # Files are retrieved separately via magnet/files
+            files={},
             links=[],
         )
 

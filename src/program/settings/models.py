@@ -12,7 +12,7 @@ from pydantic import (
     BeforeValidator,
 )
 from pydantic.networks import PostgresDsn
-from RTN.models import SettingsModel
+from RTN.models import ResolutionConfig, SettingsModel
 
 from program.settings.migratable import MigratableBaseModel
 from program.utils import generate_api_key, get_version
@@ -821,7 +821,18 @@ class ScraperModel(Observable):
 # Version Ranking Model (set application defaults here!)
 
 
-class RTNSettingsModel(SettingsModel, Observable): ...
+class RTNSettingsModel(SettingsModel, Observable):
+    resolutions: ResolutionConfig = Field(
+        default_factory=lambda: ResolutionConfig(
+            r2160p=True,
+            r1080p=True,
+            r720p=False,
+            r480p=False,
+            r360p=False,
+            unknown=True,
+        ),
+        description="Enabled resolution tiers (2160p/4K and 1080p only by default)",
+    )
 
 
 # Application Settings

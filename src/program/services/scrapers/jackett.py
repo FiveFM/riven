@@ -9,7 +9,7 @@ from requests import ReadTimeout
 from program.media.item import MediaItem, Movie
 from program.services.scrapers.base import ScraperService
 from program.settings import settings_manager
-from program.utils.request import SmartSession, get_hostname_from_url
+from program.utils.request import CircuitBreakerOpen, SmartSession, get_hostname_from_url
 from program.utils.torrent import extract_infohash, normalize_infohash
 from program.settings.models import JackettConfig
 
@@ -92,6 +92,8 @@ class Jackett(ScraperService[JackettConfig]):
 
         try:
             return self.scrape(item)
+        except CircuitBreakerOpen:
+            logger.debug(f"Circuit breaker OPEN for Jackett; skipping {item.log_string}")
         except Exception as e:
             if "rate limit" in str(e).lower() or "429" in str(e):
                 logger.debug(f"Jackett ratelimit exceeded for item: {item.log_string}")
@@ -151,7 +153,7 @@ class Jackett(ScraperService[JackettConfig]):
                     thread_name_prefix="JackettHashExtract", max_workers=10
                 ) as executor:
                     future_to_result = {
-                        executor.submit(self.get_infohash_from_url, result.link): (
+                        executor.submit(self.get_infohash_from_url, result.link, self.session): (
                             result,
                             title,
                         )

@@ -262,10 +262,10 @@ def retry_library(session: Session | None = None) -> Sequence[int]:
         return ids
 
 
-def create_calendar(session: Session | None = None) -> dict[int, dict[str, Any]]:
+def create_calendar(session: Session | None = None) -> dict[str, list[dict[str, Any]]]:
     """
     Create a calendar of all upcoming/ongoing items in the library.
-    Returns a dict keyed by item.id with minimal metadata for scheduling.
+    Returns a dict keyed by date (YYYY-MM-DD) with lists of items airing on that date.
     """
 
     from program.media.item import MediaItem, Season, Show, Episode
@@ -279,7 +279,7 @@ def create_calendar(session: Session | None = None) -> dict[int, dict[str, Any]]
             .execution_options(stream_results=True)
         ).unique()
 
-        calendar = dict[int, dict[str, Any]]()
+        calendar: dict[str, list[dict[str, Any]]] = {}
 
         for item in result.scalars().yield_per(500):
             title = item.top_title
@@ -296,7 +296,8 @@ def create_calendar(session: Session | None = None) -> dict[int, dict[str, Any]]
                 show_tvdb_id = item.tvdb_id
                 show_tmdb_id = item.tmdb_id
 
-            calendar[item.id] = {
+            date_key = item.aired_at.date().isoformat()
+            item_data: dict[str, Any] = {
                 "item_id": item.id,
                 "tvdb_id": show_tvdb_id,
                 "tmdb_id": show_tmdb_id,
@@ -307,14 +308,16 @@ def create_calendar(session: Session | None = None) -> dict[int, dict[str, Any]]
             }
 
             if isinstance(item, Show):
-                calendar[item.id]["release_data"] = item.release_data
+                item_data["release_data"] = item.release_data
 
             if isinstance(item, Season):
-                calendar[item.id]["season"] = item.number
+                item_data["season"] = item.number
 
             if isinstance(item, Episode):
-                calendar[item.id]["season"] = item.parent.number
-                calendar[item.id]["episode"] = item.number
+                item_data["season"] = item.parent.number
+                item_data["episode"] = item.number
+
+            calendar.setdefault(date_key, []).append(item_data)
 
     return calendar
 

@@ -128,7 +128,7 @@ class Scraping(Runner[ScraperModel, ScraperService[Observable]]):
         """
 
         results = dict[str, str]()
-        results_lock = threading.RLock()
+        results_lock = threading.Lock()
 
         def run_service(svc: "ScraperService[Observable]", item: MediaItem) -> None:
             """Run a single service and update the results."""
@@ -137,7 +137,9 @@ class Scraping(Runner[ScraperModel, ScraperService[Observable]]):
 
             with results_lock:
                 try:
-                    results.update(service_results)
+                    for infohash, title in service_results.items():
+                        if infohash not in results or len(title) > len(results[infohash]):
+                            results[infohash] = title
                 except Exception as e:
                     logger.exception(
                         f"Error updating results for {svc.__class__.__name__}: {e}"
@@ -195,8 +197,10 @@ class Scraping(Runner[ScraperModel, ScraperService[Observable]]):
             Tuples of (service_name, parsed_streams_dict) as each service completes.
         """
         results_queue: Queue[tuple[str, dict[str, str]]] = Queue()
-        all_raw_results = dict[str, str]()
-        results_lock = threading.RLock()
+        # Accumulate parsed Stream objects incrementally — never re-parse infohashes
+        # already ranked, which would make parse_results quadratic across N scrapers.
+        parsed_master: dict[str, Stream] = {}
+        seen_infohashes: set[str] = set()
 
         def run_service_streaming(
             svc: "ScraperService[Observable]", item: MediaItem
@@ -230,16 +234,19 @@ class Scraping(Runner[ScraperModel, ScraperService[Observable]]):
                     services_completed += 1
 
                     if raw_results:
-                        with results_lock:
-                            all_raw_results.update(raw_results)
+                        # Only parse infohashes not yet seen to avoid re-ranking everything
+                        new_results = {
+                            ih: title
+                            for ih, title in raw_results.items()
+                            if ih not in seen_infohashes
+                        }
 
-                        parsed_streams = parse_results(
-                            item,
-                            all_raw_results,
-                            manual=manual,
-                        )
+                        if new_results:
+                            seen_infohashes.update(new_results)
+                            new_streams = parse_results(item, new_results, manual=manual)
+                            parsed_master.update(new_streams)
 
-                        yield (service_name, parsed_streams)
+                        yield (service_name, dict(parsed_master))
                     else:
                         yield (service_name, {})
 

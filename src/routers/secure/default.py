@@ -519,7 +519,7 @@ async def upload_logs() -> UploadLogsResponse:
 
 class CalendarResponse(BaseModel):
     data: Annotated[
-        dict[int, dict[str, Any]],
+        dict[str, list[dict[str, Any]]],
         Field(
             description="Dictionary with dates as keys and lists of media items as values"
         ),

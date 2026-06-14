@@ -382,7 +382,10 @@ class Program(threading.Thread):
         if not self.initialized:
             return
 
+        self.initialized = False  # Stop the run() loop
+
         self.scheduler_manager.stop()
+        self.em.shutdown(wait=True)  # Drain in-flight jobs gracefully
 
         if self.services:
             self.services.filesystem.close()
