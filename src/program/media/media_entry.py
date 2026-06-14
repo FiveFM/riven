@@ -42,8 +42,9 @@ class MediaEntry(FilesystemEntry):
     # Media-specific fields
     # Note: file_size and is_directory are inherited from FilesystemEntry base class
     # original_filename is the source of truth - all VFS paths are generated from this
+    # Index is declared once in __table_args__ below (avoid a duplicate index).
     original_filename: Mapped[str] = mapped_column(
-        sqlalchemy.String, nullable=False, index=True
+        sqlalchemy.String, nullable=False
     )
 
     # Debrid service fields

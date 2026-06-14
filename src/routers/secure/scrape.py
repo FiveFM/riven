@@ -971,7 +971,11 @@ def _download_and_update(
         item = session.merge(item)
 
         assert scraping_session.torrent_id is not None
-        info = debrid_service.get_torrent_info(scraping_session.torrent_id)
+        # Reuse the torrent info already fetched during start_manual_session
+        # instead of making a redundant debrid API call.
+        info = scraping_session.torrent_info or debrid_service.get_torrent_info(
+            scraping_session.torrent_id
+        )
         if not info or not info.files:
             raise HTTPException(
                 status_code=500,

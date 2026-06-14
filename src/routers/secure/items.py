@@ -378,45 +378,56 @@ async def add_items(
 
     with db_session() as session:
         if all_tmdb_ids:
-            for id in all_tmdb_ids:
-                # Check if item exists using ORM
-                existing = session.execute(
-                    select(MediaItem).where(MediaItem.tmdb_id == id)
-                ).scalar_one_or_none()
-
-                if not existing:
-                    item = MediaItem(
-                        {
-                            "tmdb_id": id,
-                            "requested_by": "riven",
-                            "requested_at": datetime.now(),
-                        }
+            # Fetch all existing IDs in a single query instead of one SELECT per ID.
+            existing_tmdb_ids = set(
+                session.execute(
+                    select(MediaItem.tmdb_id).where(
+                        MediaItem.tmdb_id.in_(all_tmdb_ids)
                     )
+                ).scalars()
+            )
 
-                    if item:
-                        items.append(item)
-                else:
+            for id in all_tmdb_ids:
+                if id in existing_tmdb_ids:
                     logger.debug(f"Item with TMDB ID {id} already exists")
+                    continue
+
+                item = MediaItem(
+                    {
+                        "tmdb_id": id,
+                        "requested_by": "riven",
+                        "requested_at": datetime.now(),
+                    }
+                )
+
+                if item:
+                    items.append(item)
 
         if all_tvdb_ids:
-            for id in all_tvdb_ids:
-                # Check if item exists using ORM
-                existing = session.execute(
-                    select(MediaItem).where(MediaItem.tvdb_id == id)
-                ).scalar_one_or_none()
-
-                if not existing:
-                    item = MediaItem(
-                        {
-                            "tvdb_id": id,
-                            "requested_by": "riven",
-                            "requested_at": datetime.now(),
-                        }
+            # Fetch all existing IDs in a single query instead of one SELECT per ID.
+            existing_tvdb_ids = set(
+                session.execute(
+                    select(MediaItem.tvdb_id).where(
+                        MediaItem.tvdb_id.in_(all_tvdb_ids)
                     )
-                    if item:
-                        items.append(item)
-                else:
+                ).scalars()
+            )
+
+            for id in all_tvdb_ids:
+                if id in existing_tvdb_ids:
                     logger.debug(f"Item with TVDB ID {id} already exists")
+                    continue
+
+                item = MediaItem(
+                    {
+                        "tvdb_id": id,
+                        "requested_by": "riven",
+                        "requested_at": datetime.now(),
+                    }
+                )
+
+                if item:
+                    items.append(item)
 
         if items:
             for item in items:
@@ -587,6 +598,8 @@ async def reset_items(
                 .all()
             )
 
+            all_refresh_paths = list[str]()
+
             for media_item in items:
                 try:
                     # Gather all refresh paths before reset (entry may appear at multiple VFS paths)
@@ -628,23 +641,21 @@ async def reset_items(
                         else:
                             i.reset()
 
-                    apply_item_mutation(
-                        di[Program],
-                        session,
-                        media_item,
-                        mutation,
-                        bubble_parents=True,
-                    )
+                    # Per-item SAVEPOINT preserves error isolation; the batch is
+                    # committed once after the loop.
+                    with session.begin_nested():
+                        apply_item_mutation(
+                            di[Program],
+                            session,
+                            media_item,
+                            mutation,
+                            bubble_parents=True,
+                        )
 
-                    session.commit()
-
-                    # Trigger media server refresh for all paths where this item appeared
-                    if updater and updater.initialized:
-                        for refresh_path in refresh_paths:
-                            updater.refresh_path(refresh_path)
-                            logger.debug(
-                                f"Triggered media server refresh for {refresh_path}"
-                            )
+                    # Defer media server refresh until after the batch commit.
+                    for refresh_path in refresh_paths:
+                        if refresh_path not in all_refresh_paths:
+                            all_refresh_paths.append(refresh_path)
 
                 except ValueError as e:
                     logger.error(
@@ -656,6 +667,16 @@ async def reset_items(
                         f"Unexpected error while resetting item with id {media_item.id}: {str(e)}"
                     )
                     continue
+
+            session.commit()
+
+            # Trigger media server refresh for all paths where reset items appeared
+            if updater and updater.initialized:
+                for refresh_path in all_refresh_paths:
+                    updater.refresh_path(refresh_path)
+                    logger.debug(
+                        f"Triggered media server refresh for {refresh_path}"
+                    )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -690,6 +711,8 @@ async def retry_items(
     parsed_ids = handle_ids(payload.ids)
 
     with db_session() as session:
+        retried_ids = list[int]()
+
         for id in parsed_ids:
             try:
                 item = session.get(MediaItem, id)
@@ -699,21 +722,27 @@ async def retry_items(
                     def mutation(i: MediaItem, s: Session):
                         _reset_scrape_state(i)
 
-                    apply_item_mutation(
-                        program=di[Program],
-                        session=session,
-                        item=item,
-                        mutation_fn=mutation,
-                        bubble_parents=True,
-                    )
+                    # Per-item SAVEPOINT; the batch is committed once after the loop.
+                    with session.begin_nested():
+                        apply_item_mutation(
+                            program=di[Program],
+                            session=session,
+                            item=item,
+                            mutation_fn=mutation,
+                            bubble_parents=True,
+                        )
 
-                    session.commit()
-
-                    di[Program].em.add_event(Event("RetryItem", id))
+                    retried_ids.append(id)
             except ValueError as e:
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
                 )
+
+        session.commit()
+
+        # Re-queue the successfully reset items only after the commit lands.
+        for id in retried_ids:
+            di[Program].em.add_event(Event("RetryItem", id))
 
     return RetryResponse(
         message=f"Retried items with ids {parsed_ids}",
@@ -1158,19 +1187,24 @@ async def pause_items(
                         def mutation(i: MediaItem, s: Session):
                             i.store_state(States.Paused)
 
-                        apply_item_mutation(
-                            di[Program],
-                            session,
-                            media_item,
-                            mutation,
-                            bubble_parents=False,
-                        )
-                        session.commit()
+                        # Per-item SAVEPOINT preserves error isolation (a single
+                        # failing item rolls back only itself) while the batch is
+                        # persisted with one commit after the loop.
+                        with session.begin_nested():
+                            apply_item_mutation(
+                                di[Program],
+                                session,
+                                media_item,
+                                mutation,
+                                bubble_parents=False,
+                            )
 
                     logger.info("Successfully paused items.")
                 except Exception as e:
                     logger.error(f"Failed to pause {media_item.log_string}: {str(e)}")
                     continue
+
+            session.commit()
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -1206,6 +1240,8 @@ async def unpause_items(
                 .all()
             )
 
+            unpaused_ids = list[int]()
+
             for media_item in items:
                 try:
                     if media_item.last_state == States.Paused:
@@ -1213,17 +1249,18 @@ async def unpause_items(
                         def mutation(i: MediaItem, s: Session):
                             i.store_state(States.Requested)
 
-                        apply_item_mutation(
-                            di[Program],
-                            session,
-                            media_item,
-                            mutation,
-                            bubble_parents=True,
-                        )
+                        # Per-item SAVEPOINT preserves error isolation; the batch
+                        # is committed once after the loop.
+                        with session.begin_nested():
+                            apply_item_mutation(
+                                di[Program],
+                                session,
+                                media_item,
+                                mutation,
+                                bubble_parents=True,
+                            )
 
-                        session.commit()
-
-                        di[Program].em.add_event(Event("RetryItem", media_item.id))
+                        unpaused_ids.append(media_item.id)
 
                         logger.info(f"Successfully unpaused {media_item.log_string}")
                     else:
@@ -1233,6 +1270,12 @@ async def unpause_items(
                 except Exception as e:
                     logger.error(f"Failed to unpause {media_item.log_string}: {str(e)}")
                     continue
+
+            session.commit()
+
+            # Re-queue the successfully unpaused items only after the commit lands.
+            for item_id in unpaused_ids:
+                di[Program].em.add_event(Event("RetryItem", item_id))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

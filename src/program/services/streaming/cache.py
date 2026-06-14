@@ -90,6 +90,9 @@ class Cache:
         self._lock = trio.Lock()
         # Thread lock for synchronizing _index/_by_path access
         self._thread_lock = threading.Lock()
+        # Tracks which two-char fanout subdirs have been created so we can skip
+        # a redundant mkdir() syscall on every hot-path cache operation.
+        self._created_subdirs = set[str]()
         self._metrics = Metrics()
         self._last_log = 0.0  # Initialize last log timestamp
 
@@ -227,7 +230,12 @@ class Cache:
         # Two-level fanout to avoid too many files in one dir
         sub = key[:2]
         p = self.cfg.cache_dir / sub
-        p.mkdir(parents=True, exist_ok=True)
+        # Only mkdir the first time we touch a given fanout subdir. There are at
+        # most 256 of them and they are never removed, so this avoids a syscall
+        # on every get()/put()/has()/evict.
+        if sub not in self._created_subdirs:
+            p.mkdir(parents=True, exist_ok=True)
+            self._created_subdirs.add(sub)
         return p / key
 
     def _metadata_file_for(self, key: str) -> Path:
@@ -313,12 +321,9 @@ class Cache:
         removed = 0
 
         async with self.locks():
-            for k in list(self._index.keys()):
-                cache_entry = self._index.get(k)
-
-                if not cache_entry:
-                    continue
-
+            # Snapshot items() so we can mutate _index inside the loop without a
+            # second per-key dict lookup.
+            for k, cache_entry in list(self._index.items()):
                 if now - cache_entry.mtime > ttl:
                     fp = self._file_for(k)
 

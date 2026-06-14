@@ -168,8 +168,9 @@ class EventManager:
             # Always clean up regardless of success, failure, or cancellation.
             # NOTE: do NOT call remove_event_from_running anywhere else in this method
             # to avoid a double-removal ValueError.
-            if future_with_event in self._futures:
-                self._futures.remove(future_with_event)
+            with self.mutex:
+                if future_with_event in self._futures:
+                    self._futures.remove(future_with_event)
 
             if future_with_event.event:
                 self.remove_event_from_running(future_with_event.event)
@@ -268,9 +269,12 @@ class EventManager:
             item (MediaItem): The event item to remove from the queue.
         """
 
-        for event in self._queued_events:
-            if event.item_id == item_id:
-                self.remove_event_from_queue(event)
+        with self.mutex:
+            # Iterate a snapshot: remove_event_from_queue mutates _queued_events,
+            # and other threads may append concurrently.
+            for event in list(self._queued_events):
+                if event.item_id == item_id:
+                    self.remove_event_from_queue(event)
 
     def add_event_to_running(self, event: Event):
         """
@@ -294,9 +298,12 @@ class EventManager:
             item (MediaItem): The event item to remove from the running events.
         """
 
-        for event in self._running_events:
-            if event.item_id == item_id:
-                self.remove_event_from_running(event)
+        with self.mutex:
+            # Iterate a snapshot: remove_event_from_running mutates _running_events,
+            # and other threads may append concurrently.
+            for event in list(self._running_events):
+                if event.item_id == item_id:
+                    self.remove_event_from_running(event)
 
     def remove_id_from_queues(self, item_id: int):
         """
@@ -361,7 +368,8 @@ class EventManager:
             cancellation_event=cancellation_event,
         )
 
-        self._futures.append(future_with_event)
+        with self.mutex:
+            self._futures.append(future_with_event)
 
         if event and event.item_id:
             self.add_event_to_running(event)
@@ -596,7 +604,8 @@ class EventManager:
             dict[str, list[int]]: A dictionary with the event types as keys and a list of item IDs as values.
         """
 
-        events = [future.event for future in self._futures if future.event]
+        with self.mutex:
+            events = [future.event for future in self._futures if future.event]
         event_types = [
             "Scraping",
             "Downloader",

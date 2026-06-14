@@ -1,5 +1,7 @@
 """Orionoid scraper module"""
 
+import time
+
 from loguru import logger
 from pydantic import BaseModel, ValidationError
 
@@ -120,6 +122,11 @@ class Orionoid(ScraperService[OrionoidConfig]):
         self.is_premium = False
         self.is_unlimited = False
         self.initialized = False
+        # Cache the last limit-check result so we don't make a full HTTP round-trip
+        # before every single scrape (the bucket only refreshes daily anyway).
+        self._limit_hit_cache: bool = False
+        self._limit_checked_at: float = 0.0
+        self._limit_cache_ttl: float = 60.0
 
         self.session = SmartSession(
             base_url=self.base_url,
@@ -187,7 +194,17 @@ class Orionoid(ScraperService[OrionoidConfig]):
     def check_limit(self) -> bool:
         """Check if the user has exceeded the rate limit for the Orionoid API."""
 
+        # Serve a recently-fetched result instead of making an HTTP round-trip
+        # before every scrape. The daily quota changes slowly, so a short TTL is
+        # plenty and keeps these checks from eating into the per-minute rate limit.
+        now = time.time()
+
+        if now - self._limit_checked_at < self._limit_cache_ttl:
+            return self._limit_hit_cache
+
         url = f"?keyapp={KEY_APP}&keyuser={self.settings.api_key}&mode=user&action=retrieve"
+
+        limit_hit = False
 
         try:
             response = self.session.get(url)
@@ -198,19 +215,19 @@ class Orionoid(ScraperService[OrionoidConfig]):
                 logger.error(
                     f"Orionoid failed to check limit: {error_response.result.message}"
                 )
+            else:
+                data = OrionoidAuthResponse.model_validate(response.json())
 
-                return False
-
-            data = OrionoidAuthResponse.model_validate(response.json())
-
-            if data.data:
-                remaining = data.data.requests.streams.daily.remaining
-
-                return remaining is not None and remaining <= 0
+                if data.data:
+                    remaining = data.data.requests.streams.daily.remaining
+                    limit_hit = remaining is not None and remaining <= 0
         except Exception as e:
             logger.error(f"Orionoid failed to check limit: {e}")
 
-        return False
+        self._limit_hit_cache = limit_hit
+        self._limit_checked_at = now
+
+        return limit_hit
 
     def run(self, item: MediaItem) -> dict[str, str]:
         """Scrape the orionoid site for the given media items and update the object with scraped streams."""

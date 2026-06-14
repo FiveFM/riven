@@ -2102,24 +2102,29 @@ class RivenVFS(pyfuse3.Operations):
 
         if stream_key not in self._active_streams:
             async with self._active_streams_lock:
-                # Get provider info and URL from database
-                entry_info = await trio.to_thread.run_sync(
-                    lambda: self.vfs_db.get_entry_by_original_filename(
-                        original_filename=original_filename,
+                # Double-check inside the lock: FUSE can issue concurrent reads on
+                # the same file handle, and without this re-check two coroutines
+                # could each construct a MediaStream, orphaning the first one's
+                # background task and leaking its debrid HTTP connection.
+                if stream_key not in self._active_streams:
+                    # Get provider info and URL from database
+                    entry_info = await trio.to_thread.run_sync(
+                        lambda: self.vfs_db.get_entry_by_original_filename(
+                            original_filename=original_filename,
+                        )
                     )
-                )
 
-                if not entry_info or not entry_info.url or not entry_info.provider:
-                    raise pyfuse3.FUSEError(errno.ENOENT)
+                    if not entry_info or not entry_info.url or not entry_info.provider:
+                        raise pyfuse3.FUSEError(errno.ENOENT)
 
-                self._active_streams[stream_key] = MediaStream(
-                    fh=fh,
-                    file_size=file_size,
-                    path=path,
-                    original_filename=original_filename,
-                    provider=entry_info.provider,
-                    initial_url=entry_info.url,
-                    nursery=self.stream_nursery,
-                )
+                    self._active_streams[stream_key] = MediaStream(
+                        fh=fh,
+                        file_size=file_size,
+                        path=path,
+                        original_filename=original_filename,
+                        provider=entry_info.provider,
+                        initial_url=entry_info.url,
+                        nursery=self.stream_nursery,
+                    )
 
         return self._active_streams[stream_key]

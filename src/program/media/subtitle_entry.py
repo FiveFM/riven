@@ -22,14 +22,14 @@ class SubtitleEntry(FilesystemEntry):
     # Note: is_directory (inherited from FilesystemEntry) is always False for subtitles
 
     # ISO 639-3 language code (e.g., 'eng', 'spa', 'fra')
-    language: Mapped[str] = mapped_column(sqlalchemy.String, nullable=False, index=True)
+    # Indexes are declared once in __table_args__ below (avoid duplicate indexes).
+    language: Mapped[str] = mapped_column(sqlalchemy.String, nullable=False)
 
     # Original filename of the parent MediaEntry (video file)
     # Used to generate subtitle paths dynamically alongside the video
     parent_original_filename: Mapped[str | None] = mapped_column(
         sqlalchemy.String,
         nullable=True,
-        index=True,
         comment="Original filename of the parent MediaEntry (video file)",
     )
 
@@ -37,9 +37,7 @@ class SubtitleEntry(FilesystemEntry):
     content: Mapped[str | None] = mapped_column(sqlalchemy.Text, nullable=True)
 
     # OpenSubtitles hash of the video file this subtitle is for
-    file_hash: Mapped[str | None] = mapped_column(
-        sqlalchemy.String, nullable=True, index=True
-    )
+    file_hash: Mapped[str | None] = mapped_column(sqlalchemy.String, nullable=True)
 
     # Size of the VIDEO file (needed for OpenSubtitles API, not the subtitle file size)
     video_file_size: Mapped[int | None] = mapped_column(
@@ -48,7 +46,7 @@ class SubtitleEntry(FilesystemEntry):
 
     # OpenSubtitles subtitle ID for tracking
     opensubtitles_id: Mapped[str | None] = mapped_column(
-        sqlalchemy.String, nullable=True, index=True
+        sqlalchemy.String, nullable=True
     )
 
     __mapper_args__ = {

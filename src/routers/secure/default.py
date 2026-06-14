@@ -282,11 +282,19 @@ async def get_stats() -> StatsResponse:
 
             total_symlinks = movies_symlinks + episodes_symlinks
 
-            total_movies = conn.execute(select(func.count(Movie.id))).scalar_one()
-            total_shows = conn.execute(select(func.count(Show.id))).scalar_one()
-            total_seasons = conn.execute(select(func.count(Season.id))).scalar_one()
-            total_episodes = conn.execute(select(func.count(Episode.id))).scalar_one()
-            total_items = conn.execute(select(func.count(MediaItem.id))).scalar_one()
+            # Single grouped query instead of 5 separate COUNT round-trips.
+            type_counts_result = conn.execute(
+                select(MediaItem.type, func.count(MediaItem.id)).group_by(
+                    MediaItem.type
+                )
+            )
+            type_counts = {row[0]: row[1] for row in type_counts_result}
+
+            total_movies = type_counts.get("movie", 0)
+            total_shows = type_counts.get("show", 0)
+            total_seasons = type_counts.get("season", 0)
+            total_episodes = type_counts.get("episode", 0)
+            total_items = sum(type_counts.values())
 
             activity = dict[str, int]()
 
@@ -333,14 +341,18 @@ async def get_stats() -> StatsResponse:
                 for media_item_id, scraped_times in batch:
                     incomplete_retries[media_item_id] = scraped_times
 
-            states = dict[States, int]()
+            # Single grouped query instead of one COUNT per state enum value.
+            states = {state: 0 for state in States}
 
-            for state in States:
-                states[state] = conn.execute(
-                    select(func.count(MediaItem.id)).where(
-                        MediaItem.last_state == state
-                    )
-                ).scalar_one()
+            state_counts_result = conn.execute(
+                select(MediaItem.last_state, func.count(MediaItem.id)).group_by(
+                    MediaItem.last_state
+                )
+            )
+
+            for state, count in state_counts_result:
+                if state is not None:
+                    states[state] = count
 
     return StatsResponse(
         total_items=total_items,
