@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from loguru import logger
 from RTN import ParsedData
@@ -121,36 +122,44 @@ class Downloader(Runner[None, DownloaderBase]):
             tried_streams = 0
 
             for stream in sorted_streams:
-                # Try each available service for this stream before blacklisting
-                stream_failed_on_all_services = True
                 stream_hit_circuit_breaker = False
 
-                for service in available_services:
-                    logger.debug(
-                        f"Trying stream {stream.infohash} on {service.key} for {item.log_string}"
-                    )
+                # Fire availability checks across all services in parallel, then download
+                # from the preferred service (or the first available one).
+                hits, cb_services = self._parallel_availability_check(
+                    stream, item, available_services
+                )
 
+                for svc_key in cb_services:
+                    self._service_cooldowns[svc_key] = datetime.now() + timedelta(minutes=1)
+                    hit_circuit_breaker = True
+                    stream_hit_circuit_breaker = True
+
+                if not hits:
+                    if stream_hit_circuit_breaker and len(self.initialized_services) == 1:
+                        logger.debug(
+                            f"Stream {stream.infohash} hit circuit breaker on single provider, will retry after cooldown"
+                        )
+                    else:
+                        logger.debug(
+                            f"Stream {stream.infohash} not available on any of {len(available_services)} service(s), blacklisting"
+                        )
+                        item.blacklist_stream(stream)
+
+                    tried_streams += 1
+
+                    if tried_streams >= 3:
+                        yield RunnerResult(media_items=[item])
+
+                    continue
+
+                # Try hits in preference order until one download succeeds.
+                for service, container in hits:
                     download_result: DownloadedTorrent | None = None
 
                     try:
-                        # Validate stream on this specific service
-                        container = self.validate_stream_on_service(
-                            stream,
-                            item,
-                            service,
-                        )
-
-                        if not container:
-                            logger.debug(
-                                f"Stream {stream.infohash} not available on {service.key}"
-                            )
-                            continue
-
-                        # Try to download using this service
                         download_result = self.download_cached_stream_on_service(
-                            stream,
-                            container,
-                            service,
+                            stream, container, service
                         )
 
                         if self.update_item_attributes(item, download_result, service):
@@ -159,53 +168,47 @@ class Downloader(Runner[None, DownloaderBase]):
                                 f"Downloaded {item.log_string} from '{stream.raw_title}' [{stream.infohash}] using {service.key}",
                             )
 
-                            download_success = True
-                            stream_failed_on_all_services = False
+                            # Clean up torrents that were added on non-winning services.
+                            for losing_service, losing_container in hits:
+                                if losing_service is not service and losing_container.torrent_id:
+                                    try:
+                                        losing_service.delete_torrent(losing_container.torrent_id)
+                                    except Exception:
+                                        pass
 
+                            download_success = True
                             break
                         else:
                             raise NoMatchingFilesException(
                                 f"No valid files found for {item.log_string} ({item.id})"
                             )
-                    except CircuitBreakerOpen as e:
-                        # This specific service hit circuit breaker, set cooldown and try next service
-                        cooldown_duration = timedelta(minutes=1)
-                        self._service_cooldowns[service.key] = (
-                            datetime.now() + cooldown_duration
-                        )
-                        logger.warning(
-                            f"Circuit breaker OPEN for {service.key}, trying next service for stream {stream.infohash}"
-                        )
-                        stream_hit_circuit_breaker = True
-                        hit_circuit_breaker = True
 
-                        # If this is the only initialized service, don't mark stream as failed
-                        # We want to retry this stream after cooldown
-                        if len(self.initialized_services) == 1:
-                            stream_failed_on_all_services = False
+                    except CircuitBreakerOpen:
+                        cooldown_duration = timedelta(minutes=1)
+                        self._service_cooldowns[service.key] = datetime.now() + cooldown_duration
+                        logger.warning(
+                            f"Circuit breaker OPEN for {service.key} during download of {stream.infohash}"
+                        )
+                        hit_circuit_breaker = True
                         continue
 
                     except Exception as e:
-                        logger.debug(
-                            f"Stream {stream.infohash} failed on {service.key}: {e}"
-                        )
+                        logger.debug(f"Stream {stream.infohash} failed on {service.key}: {e}")
 
                         if download_result and download_result.id:
                             try:
                                 service.delete_torrent(download_result.id)
-
                                 logger.debug(
-                                    f"Deleted failed torrent {stream.infohash} for {item.log_string} ({item.id}) on {service.key}."
+                                    f"Deleted failed torrent {stream.infohash} on {service.key}"
                                 )
                             except Exception as del_e:
                                 logger.debug(
-                                    f"Failed to delete torrent {stream.infohash} for {item.log_string} ({item.id}) on {service.key}: {del_e}"
+                                    f"Failed to delete torrent {stream.infohash} on {service.key}: {del_e}"
                                 )
                         continue
 
                 # If stream succeeded on any service, we're done
                 if download_success:
-                    # Add probed data if required
                     if self.subtitles_enabled:
                         from program.services.media_analysis import (
                             media_analysis_service,
@@ -218,29 +221,18 @@ class Downloader(Runner[None, DownloaderBase]):
                                 logger.debug(
                                     f"Media analysis completed for {item.log_string}"
                                 )
-                                break
                             else:
                                 logger.error(
                                     f"Failed to analyze media file for {item.log_string}"
                                 )
-                    else:
-                        break
 
-                # Only blacklist if stream genuinely failed on ALL available services
-                # Don't blacklist if we hit circuit breaker in single-provider mode
-                if stream_failed_on_all_services:
-                    if (
-                        stream_hit_circuit_breaker
-                        and len(self.initialized_services) == 1
-                    ):
-                        logger.debug(
-                            f"Stream {stream.infohash} hit circuit breaker on single provider, will retry after cooldown"
-                        )
-                    else:
-                        logger.debug(
-                            f"Stream {stream.infohash} failed on all {len(available_services)} available service(s), blacklisting"
-                        )
-                        item.blacklist_stream(stream)
+                    break
+
+                if not download_success:
+                    logger.debug(
+                        f"Stream {stream.infohash} found on {len(hits)} service(s) but all downloads failed, blacklisting"
+                    )
+                    item.blacklist_stream(stream)
 
                 tried_streams += 1
 
@@ -322,6 +314,68 @@ class Downloader(Runner[None, DownloaderBase]):
             return container
 
         return None
+
+    def _parallel_availability_check(
+        self,
+        stream: Stream,
+        item: MediaItem,
+        services: list["DownloaderBase"],
+    ) -> tuple[list[tuple["DownloaderBase", TorrentContainer]], list[str]]:
+        """
+        Fire availability checks against all services simultaneously.
+
+        Returns:
+            (hits, cb_services) where:
+              hits         — list of (service, container) pairs sorted so the
+                             configured preferred_service appears first.
+              cb_services  — keys of services whose circuit breaker opened.
+        """
+
+        preferred = settings_manager.settings.downloaders.preferred_service
+
+        hits: dict["DownloaderBase", TorrentContainer] = {}
+        cb_services: list[str] = []
+
+        def check(svc: "DownloaderBase") -> tuple["DownloaderBase", TorrentContainer | None]:
+            return svc, self.validate_stream_on_service(stream, item, svc)
+
+        with ThreadPoolExecutor(max_workers=max(len(services), 1)) as executor:
+            futures = {executor.submit(check, svc): svc for svc in services}
+
+            for future in as_completed(futures):
+                svc = futures[future]
+
+                try:
+                    _, container = future.result()
+
+                    if container:
+                        hits[svc] = container
+                    else:
+                        logger.debug(
+                            f"Stream {stream.infohash} not available on {svc.key}"
+                        )
+                except CircuitBreakerOpen:
+                    logger.warning(
+                        f"Circuit breaker OPEN for {svc.key} during parallel availability check of {stream.infohash}"
+                    )
+                    cb_services.append(svc.key)
+                except Exception as e:
+                    logger.debug(
+                        f"Availability check failed for {stream.infohash} on {svc.key}: {e}"
+                    )
+
+        sorted_hits = sorted(
+            hits.items(),
+            key=lambda pair: (0 if pair[0].key == preferred else 1),
+        )
+
+        if len(sorted_hits) > 1:
+            keys = [s.key for s, _ in sorted_hits]
+            logger.debug(
+                f"Stream {stream.infohash} cached on multiple services {keys}; using {keys[0]} (preferred={preferred or 'none'})"
+            )
+
+        return sorted_hits, cb_services
 
     def update_item_attributes(
         self,

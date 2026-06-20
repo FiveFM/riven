@@ -99,6 +99,10 @@ class DownloadersModel(Observable):
     proxy_url: EmptyOrUrl = Field(
         default="", description="Proxy URL for downloaders (optional)"
     )
+    preferred_service: str = Field(
+        default="",
+        description="Preferred downloader service key (e.g. 'torbox' or 'alldebrid'). Used as tiebreaker when multiple services have the same hash cached.",
+    )
     real_debrid: RealDebridModel = Field(
         default_factory=lambda: RealDebridModel(),
         description="Real-Debrid downloader configuration",
