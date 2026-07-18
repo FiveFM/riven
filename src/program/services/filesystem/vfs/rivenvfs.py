@@ -812,7 +812,8 @@ class RivenVFS(pyfuse3.Operations):
             self._inode_to_node = {pyfuse3.ROOT_INODE: self._root}
 
         # Clear pending invalidations for this sync
-        self._pending_invalidations.clear()
+        with self._tree_lock:
+            self._pending_invalidations.clear()
 
         # Step 3: Re-register all items
         logger.debug(f"Re-registering {len(item_ids)} items")
@@ -849,24 +850,10 @@ class RivenVFS(pyfuse3.Operations):
 
         # Step 5: Batch invalidate all collected inodes
         # This is critical: reduces syscalls from O(n) to O(1)
-        if self._pending_invalidations:
-            invalidated_count = 0
-            try:
-                for inode in self._pending_invalidations:
-                    try:
-                        pyfuse3.invalidate_inode(inode, attr_only=False)
-                        invalidated_count += 1
-                    except OSError as e:
-                        # Expected: some inodes may not be in kernel cache
-                        # This is not an error, just means kernel already evicted them
-                        if e.errno != errno.ENOENT:
-                            logger.trace(f"Could not invalidate inode {inode}: {e}")
-                if invalidated_count > 0:
-                    logger.trace(
-                        f"Batch invalidated {invalidated_count}/{len(self._pending_invalidations)} inodes"
-                    )
-            finally:
-                self._pending_invalidations.clear()
+        invalidated_count = self._flush_pending_invalidations()
+
+        if invalidated_count > 0:
+            logger.trace(f"Batch invalidated {invalidated_count} inodes")
 
         # Invalidate root directory
         if registered_count > 0:
@@ -1110,26 +1097,48 @@ class RivenVFS(pyfuse3.Operations):
             logger.warning(f"Unknown FilesystemEntry type: {type(entry)}")
             return []
 
-    def _flush_pending_invalidations(self) -> None:
+    def _flush_pending_invalidations(self) -> int:
         """
         Immediately push all accumulated parent-inode invalidations to the kernel.
 
         Called after individual add() operations so that the kernel dentry cache for
         parent directories is evicted right away, letting Plex see new files without
         waiting for the 300-second entry_timeout to expire.
-        """
-        if not self.mounted or not self._pending_invalidations:
-            self._pending_invalidations.clear()
-            return
 
-        for inode in self._pending_invalidations:
+        add() runs concurrently on the FilesystemService thread pool, so the pending
+        set is swapped out under _tree_lock rather than iterated in place. Iterating
+        it directly raced _register_clean_path() two ways: "Set changed size during
+        iteration" aborting the caller, and — worse, because it was silent — inodes
+        added between the iteration and the clear being discarded without ever being
+        pushed, which is exactly the stale-dentry case this method exists to prevent.
+        Anything another thread adds after the swap lands in the fresh set and is
+        picked up by the next flush.
+
+        Returns the number of inodes successfully invalidated.
+        """
+        with self._tree_lock:
+            if not self._pending_invalidations:
+                return 0
+
+            pending = self._pending_invalidations
+            self._pending_invalidations = set()
+
+        if not self.mounted:
+            return 0
+
+        invalidated_count = 0
+
+        for inode in pending:
             try:
                 pyfuse3.invalidate_inode(inode, attr_only=False)
+                invalidated_count += 1
             except OSError as e:
+                # Expected: some inodes may not be in kernel cache
+                # This is not an error, just means kernel already evicted them
                 if e.errno != errno.ENOENT:
                     logger.trace(f"Could not invalidate inode {inode}: {e}")
 
-        self._pending_invalidations.clear()
+        return invalidated_count
 
     def _register_clean_path(
         self,

@@ -1,3 +1,4 @@
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from loguru import logger
@@ -63,8 +64,11 @@ class Downloader(Runner[None, DownloaderBase]):
 
         self.initialized = self.validate()
 
-        # Track per-service cooldowns when circuit breaker is open
+        # Track per-service cooldowns when circuit breaker is open.
+        # run() executes concurrently on the service's thread pool, so every
+        # access to this dict must hold _cooldown_lock.
         self._service_cooldowns = dict[str, datetime]()
+        self._cooldown_lock = threading.Lock()
         self.subtitles_enabled = (
             settings_manager.settings.post_processing.subtitle.enabled
         )
@@ -82,27 +86,68 @@ class Downloader(Runner[None, DownloaderBase]):
 
         return True
 
+    def _mark_service_cooldown(self, service_key: str) -> None:
+        """Put a service into circuit-breaker cooldown for one minute."""
+        with self._cooldown_lock:
+            self._service_cooldowns[service_key] = datetime.now() + timedelta(minutes=1)
+
+    def _earliest_cooldown(self) -> datetime:
+        """
+        Earliest time any service leaves cooldown.
+
+        Falls back to a fresh one-minute delay when the dict is empty: a
+        concurrent download may have succeeded and cleared its entry between
+        our failure and this read, in which case retrying shortly is correct.
+        """
+        with self._cooldown_lock:
+            earliest = min(self._service_cooldowns.values(), default=None)
+
+        return earliest if earliest is not None else datetime.now() + timedelta(minutes=1)
+
+    def _claim_available_services(self, now: datetime) -> tuple[list, datetime | None]:
+        """
+        Snapshot the services that are out of cooldown, plus the earliest retry
+        time when none are.
+
+        Both values are read under one lock acquisition. Reading them separately
+        let a concurrent success clear _service_cooldowns in between, so the
+        empty-availability branch could call min() on an empty dict and raise
+        ValueError out of the generator before its try block was entered.
+        """
+        with self._cooldown_lock:
+            available = [
+                service
+                for service in self.initialized_services
+                if service.key not in self._service_cooldowns
+                or self._service_cooldowns[service.key] <= now
+            ]
+
+            if available:
+                return available, None
+
+            return [], min(self._service_cooldowns.values(), default=None)
+
     def run(
         self,
         item: MediaItem,
     ) -> MediaItemGenerator:
         logger.debug(f"Starting download process for {item.log_string} ({item.id})")
 
-
         # Check if all services are in cooldown due to circuit breaker
         now = datetime.now()
 
-        available_services = [
-            service
-            for service in self.initialized_services
-            if service.key not in self._service_cooldowns
-            or self._service_cooldowns[service.key] <= now
-        ]
+        available_services, next_attempt = self._claim_available_services(now)
 
         if not available_services:
-            # All services are in cooldown, reschedule for the earliest available time
-            next_attempt = min(self._service_cooldowns.values())
+            if next_attempt is None:
+                # No services in cooldown yet none available means none are
+                # initialized; rescheduling would spin forever.
+                logger.error(
+                    f"No downloader services available for {item.log_string} ({item.id})"
+                )
+                return
 
+            # All services are in cooldown, reschedule for the earliest available time
             logger.warning(
                 f"All downloader services in cooldown for {item.log_string} ({item.id}), rescheduling for {next_attempt.strftime('%m/%d/%y %H:%M:%S')}"
             )
@@ -111,6 +156,9 @@ class Downloader(Runner[None, DownloaderBase]):
             return
 
         download_success = False
+
+        # The service that actually completed the download, if any.
+        successful_service = None
 
         # Track if we hit circuit breaker on any service
         hit_circuit_breaker = False
@@ -133,7 +181,7 @@ class Downloader(Runner[None, DownloaderBase]):
                 )
 
                 for svc_key in cb_services:
-                    self._service_cooldowns[svc_key] = datetime.now() + timedelta(minutes=1)
+                    self._mark_service_cooldown(svc_key)
                     hit_circuit_breaker = True
                     stream_hit_circuit_breaker = True
 
@@ -179,6 +227,7 @@ class Downloader(Runner[None, DownloaderBase]):
                                         pass
 
                             download_success = True
+                            successful_service = service
                             break
                         else:
                             raise NoMatchingFilesException(
@@ -186,8 +235,7 @@ class Downloader(Runner[None, DownloaderBase]):
                             )
 
                     except CircuitBreakerOpen:
-                        cooldown_duration = timedelta(minutes=1)
-                        self._service_cooldowns[service.key] = datetime.now() + cooldown_duration
+                        self._mark_service_cooldown(service.key)
                         logger.warning(
                             f"Circuit breaker OPEN for {service.key} during download of {stream.infohash}"
                         )
@@ -250,7 +298,7 @@ class Downloader(Runner[None, DownloaderBase]):
             # Check if we hit circuit breaker in single-provider mode
             if hit_circuit_breaker and len(self.initialized_services) == 1:
                 # Reschedule for after cooldown instead of failing
-                next_attempt = min(self._service_cooldowns.values())
+                next_attempt = self._earliest_cooldown()
 
                 logger.warning(
                     f"Single provider hit circuit breaker for {item.log_string} ({item.id}), rescheduling for {next_attempt.strftime('%m/%d/%y %H:%M:%S')}"
@@ -276,8 +324,13 @@ class Downloader(Runner[None, DownloaderBase]):
                 if tried_streams > 0:
                     yield RunnerResult(media_items=[item])
         else:
-            # Clear service cooldowns on successful download
-            self._service_cooldowns.clear()
+            # Clear the cooldown for the service that actually succeeded. Clearing
+            # the whole dict would also drop cooldowns other concurrent downloads
+            # recorded for services that are still circuit-broken, sending the next
+            # item straight back at a provider known to be failing.
+            if successful_service is not None:
+                with self._cooldown_lock:
+                    self._service_cooldowns.pop(successful_service.key, None)
 
             yield RunnerResult(media_items=[item])
 

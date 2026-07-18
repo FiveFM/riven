@@ -114,7 +114,15 @@ class CircuitBreakerOpen(RuntimeError):
 
 class CircuitBreaker:
     """
-    Circuit breaker for per-domain failure handling.
+    Circuit breaker for per-domain failure handling (thread-safe).
+
+    One instance is shared by every thread using a given SmartSession, so all
+    state transitions are guarded by an internal lock. Without it, `failures`
+    increments were lost to the read-modify-write race and the breaker tripped
+    late or not at all, letting a dead provider keep absorbing requests.
+
+    HALF_OPEN admits a single probe. Concurrent callers fail fast instead of all
+    flipping to HALF_OPEN together and stampeding the recovering host.
 
     Attributes:
         failure_threshold (int): Number of failures before tripping.
@@ -137,21 +145,55 @@ class CircuitBreaker:
         self.last_failure_time: float | None = None
         self.state = "CLOSED"
         self.name = name
+        self._lock = threading.Lock()
+        # When the in-flight HALF_OPEN probe started, or None if no probe is out.
+        self._probe_started_at: float | None = None
 
     def before_request(self):
         """
         Check circuit breaker before making a request.
 
         Raises:
-            RuntimeError: If the breaker is OPEN and recovery time not passed.
+            CircuitBreakerOpen: If the breaker is OPEN and recovery time has not
+                passed, or if it is HALF_OPEN and another thread holds the probe.
         """
-        if self.state == "OPEN" and self.last_failure_time:
-            if (time.monotonic() - self.last_failure_time) > self.recovery_time:
-                self.state = "HALF_OPEN"
-                logger.debug(f"Breaker for {self.name} HALF_OPEN (probe)")
+        now = time.monotonic()
+
+        with self._lock:
+            if self.state == "CLOSED":
+                return
+
+            if self.state == "OPEN":
+                elapsed = (
+                    None
+                    if self.last_failure_time is None
+                    else now - self.last_failure_time
+                )
+                admit = elapsed is None or elapsed > self.recovery_time
+
+                if admit:
+                    self.state = "HALF_OPEN"
+                    self._probe_started_at = now
             else:
-                logger.debug(f"Breaker for {self.name} OPEN (fail-fast)")
-                raise CircuitBreakerOpen(self.name)
+                # HALF_OPEN: admit one probe at a time. after_request() is not
+                # called from a finally block, so a probe can be lost if an
+                # exception escapes between here and there. Treat a probe older
+                # than recovery_time as abandoned, otherwise a single lost probe
+                # would wedge this domain OPEN permanently.
+                admit = (
+                    self._probe_started_at is None
+                    or (now - self._probe_started_at) > self.recovery_time
+                )
+
+                if admit:
+                    self._probe_started_at = now
+
+        if admit:
+            logger.debug(f"Breaker for {self.name} HALF_OPEN (probe)")
+            return
+
+        logger.debug(f"Breaker for {self.name} OPEN (fail-fast)")
+        raise CircuitBreakerOpen(self.name)
 
     def after_request(self, success: bool):
         """
@@ -160,25 +202,40 @@ class CircuitBreaker:
         Args:
             success (bool): True if the request succeeded, False otherwise.
         """
+        reset = False
+        tripped = False
 
-        if success:
-            if self.state in ("HALF_OPEN", "OPEN"):
-                self._reset()
-        else:
-            self.failures += 1
-            self.last_failure_time = time.monotonic()
+        with self._lock:
+            if success:
+                if self.state in ("HALF_OPEN", "OPEN"):
+                    self._reset()
+                    reset = True
+            else:
+                self.failures += 1
+                self.last_failure_time = time.monotonic()
+                # Release the probe slot; the OPEN window below gates the retry.
+                self._probe_started_at = None
 
-            if self.failures >= self.failure_threshold:
-                self.state = "OPEN"
-                logger.warning(f"Circuit breaker tripped to OPEN for {self.name}")
+                if self.failures >= self.failure_threshold:
+                    # Only log the CLOSED/HALF_OPEN -> OPEN edge. Logging every
+                    # failure past the threshold means one warning per concurrent
+                    # worker for as long as the host stays down.
+                    tripped = self.state != "OPEN"
+                    self.state = "OPEN"
+
+        if reset:
+            logger.info(f"Circuit breaker reset to CLOSED for {self.name}")
+
+        if tripped:
+            logger.warning(f"Circuit breaker tripped to OPEN for {self.name}")
 
     def _reset(self):
-        """Reset the circuit breaker to CLOSED state."""
+        """Reset the breaker to CLOSED. Caller must hold the lock."""
 
         self.failures = 0
         self.state = "CLOSED"
         self.last_failure_time = None
-        logger.info(f"Circuit breaker reset to CLOSED for {self.name}")
+        self._probe_started_at = None
 
 
 class SmartResponse(requests.Response):
