@@ -354,6 +354,11 @@ class MediaStream:
                                                     data = await anext(connection.reader)
                                                 except StopAsyncIteration:
                                                     raise DebridServiceClosedConnectionException(provider=self.provider)
+                                                except httpx.ReadError as e:
+                                                    # Mid-stream TCP reset (ECONNRESET) or other read failure.
+                                                    # Raise as a closed-connection so manage_connection retries
+                                                    # with a fresh URL instead of crashing the FUSE thread.
+                                                    raise DebridServiceClosedConnectionException(provider=self.provider) from e
 
                                             if data == b"":
                                                 raise EmptyDataException(

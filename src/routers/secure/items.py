@@ -1404,6 +1404,13 @@ async def reindex_item(
                 bubble_parents=True,
             )
 
+            # apply_item_mutation does not commit (see its docstring); without
+            # this the reindex is rolled back at session close while still
+            # reporting success. Must also precede add_event: the event loop
+            # reads the item through its own session and would otherwise route
+            # on the pre-reindex state.
+            session.commit()
+
             logger.info(f"Successfully re-indexed {item.log_string}")
 
             di[Program].em.add_event(Event("RetryItem", item.id))

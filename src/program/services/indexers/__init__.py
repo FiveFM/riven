@@ -120,9 +120,13 @@ class IndexerService(BaseIndexer):
                     try:
                         updated = next(self.run(item, log_msg=False), None)
 
-                        if updated:
+                        # run() yields RunnerResult, not a MediaItem; merging the
+                        # wrapper raises UnmappedInstanceError, which the except
+                        # below swallows, so every reindex silently did nothing.
+                        # Same unwrap as scheduler._run_reindex_for_item.
+                        if updated and updated.media_items:
                             with session.no_autoflush:
-                                session.merge(updated)
+                                session.merge(updated.media_items[0])
 
                             count += 1
                     except Exception as e:

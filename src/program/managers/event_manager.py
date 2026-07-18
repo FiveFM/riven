@@ -148,6 +148,15 @@ class EventManager:
                 # Propagate overrides to the new event to maintain setting context across service transitions
                 event_overrides = future_with_event.event.overrides if future_with_event.event else None
 
+                # Release the finished event from the running set *before*
+                # emitting its successor. The successor carries the same
+                # item_id, so leaving the predecessor in place makes add_event()
+                # dedupe the service-to-service handoff away against the very
+                # event that just completed, stalling the item. Idempotent, so
+                # the cleanup in `finally` remains correct.
+                if future_with_event.event:
+                    self.remove_event_from_running(future_with_event.event)
+
                 self.add_event(
                     Event(
                         emitted_by=service,
@@ -166,8 +175,10 @@ class EventManager:
 
         finally:
             # Always clean up regardless of success, failure, or cancellation.
-            # NOTE: do NOT call remove_event_from_running anywhere else in this method
-            # to avoid a double-removal ValueError.
+            # NOTE: the success path above already removes the event from the
+            # running set before emitting its successor; remove_event_from_running
+            # is guarded by a membership check, so this second call is a safe no-op
+            # rather than a double-removal ValueError.
             with self.mutex:
                 if future_with_event in self._futures:
                     self._futures.remove(future_with_event)
@@ -183,54 +194,90 @@ class EventManager:
             )
 
 
-    def add_event_to_queue(self, event: Event, log_message: bool = True):
+    def _prepare_event_for_queue(self, event: Event) -> bool:
+        """
+        Resolves the database state an event needs before it can be queued, and
+        decides whether it may be queued at all.
+
+        Also caches the item's last_state on the event, which next() uses for
+        priority sorting.
+
+        Callers must NOT hold `self.mutex`. This checks out a pooled connection,
+        and cancel_job holds a connection while acquiring the mutex; taking the
+        two in the opposite order here would be a lock-order inversion.
+
+        Returns:
+            True if the event may be queued, False if it must be dropped.
+        """
+
+        if not event.item_id:
+            return True
+
+        with db_session() as session:
+            try:
+                # Query just the columns we need, avoiding relationship loading entirely
+                item = (
+                    session.query(MediaItem)
+                    .filter_by(id=event.item_id)
+                    .options(
+                        sqlalchemy.orm.load_only(MediaItem.id, MediaItem.last_state)
+                    )
+                    .one_or_none()
+                )
+            except Exception as e:
+                logger.error(f"Error getting item from database: {e}")
+                return False
+
+            if not item and not event.content_item:
+                logger.error(f"No item found from event: {event.log_message}")
+                return False
+
+            if item:
+                if item.is_parent_blocked():
+                    logger.debug(
+                        f"Not queuing {item.log_string}: Item is {item.last_state}"
+                    )
+                    return False
+
+                # Cache the item state in the event for efficient priority sorting
+                if item.last_state:
+                    event.item_state = item.last_state
+
+        return True
+
+    def _enqueue(self, event: Event, log_message: bool = True):
+        """
+        Appends an event to the queue and its id index.
+
+        Callers must already hold `self.mutex` and must have had
+        `_prepare_event_for_queue` return True for this event.
+        """
+
+        self._queued_events.append(event)
+        if event.item_id:
+            self._queued_item_ids.add(event.item_id)
+
+        if log_message:
+            logger.debug(f"Added {event.log_message} to the queue.")
+
+    def add_event_to_queue(self, event: Event, log_message: bool = True) -> bool:
         """
         Adds an event to the queue.
 
         Args:
             event (Event): The event to add to the queue.
+
+        Returns:
+            True if the event was queued, False if it was rejected.
         """
 
+        if not self._prepare_event_for_queue(event):
+            return False
+
         with self.mutex:
-            if event.item_id:
-                with db_session() as session:
-                    try:
-                        # Query just the columns we need, avoiding relationship loading entirely
-                        item = (
-                            session.query(MediaItem)
-                            .filter_by(id=event.item_id)
-                            .options(
-                                sqlalchemy.orm.load_only(
-                                    MediaItem.id, MediaItem.last_state
-                                )
-                            )
-                            .one_or_none()
-                        )
-                    except Exception as e:
-                        logger.error(f"Error getting item from database: {e}")
-                        return
+            self._enqueue(event, log_message)
 
-                    if not item and not event.content_item:
-                        logger.error(f"No item found from event: {event.log_message}")
-                        return
-
-                    if item:
-                        if item.is_parent_blocked():
-                            logger.debug(
-                                f"Not queuing {item.log_string}: Item is {item.last_state}"
-                            )
-                            return
-
-                        # Cache the item state in the event for efficient priority sorting
-                        if item.last_state:
-                            event.item_state = item.last_state
-
-            self._queued_events.append(event)
-            if event.item_id:
-                self._queued_item_ids.add(event.item_id)
-
-            if log_message:
-                logger.debug(f"Added {event.log_message} to the queue.")
+        return True
 
     def remove_event_from_queue(self, event: Event):
         """
@@ -242,9 +289,28 @@ class EventManager:
 
         with self.mutex:
             self._queued_events.remove(event)
-            if event.item_id:
-                self._queued_item_ids.discard(event.item_id)
+            self._release_queued_item_id(event)
             logger.debug(f"Removed {event.log_message} from the queue.")
+
+    def _release_queued_item_id(self, event: Event):
+        """
+        Drops an event's item_id from the queued index.
+
+        `_queued_item_ids` is a set mirroring `_queued_events`, but duplicate
+        events for one item can coexist (add_event_to_queue does not dedupe, and
+        program.py enqueues through it directly), so the id is only released once
+        the last event referencing it has left the queue.
+
+        Callers must already hold `self.mutex`.
+        """
+
+        if not event.item_id:
+            return
+
+        if any(queued.item_id == event.item_id for queued in self._queued_events):
+            return
+
+        self._queued_item_ids.discard(event.item_id)
 
     def remove_event_from_running(self, event: Event):
         """
@@ -392,10 +458,17 @@ class EventManager:
             suppress_logs (bool): If True, suppresses debug logging for this operation.
         """
 
+        # Release the connection before acquiring the mutex below: the enqueue
+        # path takes the mutex, so holding a pooled connection across it would
+        # invert the lock order.
         with db_session() as session:
             item_id, related_ids = db_functions.get_item_ids(session, item_id)
-            ids_to_cancel = set([item_id] + related_ids)
 
+        ids_to_cancel = set([item_id] + related_ids)
+
+        # _process_future removes from _futures concurrently; iterating it
+        # unsynchronized skips entries and silently misses live jobs.
+        with self.mutex:
             future_map = dict[int, list[FutureWithEvent]]()
 
             for future_with_event in self._futures:
@@ -403,28 +476,28 @@ class EventManager:
                     future_item_id = future_with_event.event.item_id
                     future_map.setdefault(future_item_id, []).append(future_with_event)
 
-            for fid in ids_to_cancel:
-                if fid in future_map:
-                    for future_with_event in future_map[fid]:
-                        self.remove_id_from_queues(fid)
+        for fid in ids_to_cancel:
+            if fid in future_map:
+                for future_with_event in future_map[fid]:
+                    self.remove_id_from_queues(fid)
 
-                        if (
-                            not future_with_event.future.done()
-                            and not future_with_event.future.cancelled()
-                        ):
-                            try:
-                                future_with_event.cancellation_event.set()
-                                future_with_event.future.cancel()
+                    if (
+                        not future_with_event.future.done()
+                        and not future_with_event.future.cancelled()
+                    ):
+                        try:
+                            future_with_event.cancellation_event.set()
+                            future_with_event.future.cancel()
 
-                                logger.debug(f"Canceled job for Item ID {fid}")
-                            except Exception as e:
-                                if not suppress_logs:
-                                    logger.error(
-                                        f"Error cancelling future for {fid}: {str(e)}"
-                                    )
+                            logger.debug(f"Canceled job for Item ID {fid}")
+                        except Exception as e:
+                            if not suppress_logs:
+                                logger.error(
+                                    f"Error cancelling future for {fid}: {str(e)}"
+                                )
 
-            for fid in ids_to_cancel:
-                self.remove_id_from_queues(fid)
+        for fid in ids_to_cancel:
+            self.remove_id_from_queues(fid)
 
     def next(self) -> Event:
         """
@@ -473,6 +546,10 @@ class EventManager:
                     # Get the highest priority event
                     event = ready_events[0]
                     self._queued_events.remove(event)
+                    # Dequeuing must release the id too, or add_event() rejects
+                    # this item as "already in the queue" for the rest of the
+                    # process lifetime and it never advances again.
+                    self._release_queued_item_id(event)
 
                     return event
             raise Empty
@@ -524,6 +601,12 @@ class EventManager:
             with db_session() as session:
                 item_id, related_ids = db_functions.get_item_ids(session, event.item_id)
 
+        # Resolve DB state up front, outside the mutex: doing it during the
+        # enqueue below would hold the mutex across a pooled connection checkout.
+        # A rejection here is a genuine drop, so it must be reported as False.
+        if not self._prepare_event_for_queue(event):
+            return False
+
         with self.mutex:
             if item_id:
                 if self._id_in_queue(item_id):
@@ -563,7 +646,7 @@ class EventManager:
 
                     return False
 
-            self.add_event_to_queue(event)
+            self._enqueue(event)
 
         return True
 

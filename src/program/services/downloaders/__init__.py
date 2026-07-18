@@ -115,11 +115,13 @@ class Downloader(Runner[None, DownloaderBase]):
         # Track if we hit circuit breaker on any service
         hit_circuit_breaker = False
 
+        # Bound before the try: the failure path below reads it, and an
+        # exception from sort_streams_by_quality would otherwise leave it unset.
+        tried_streams = 0
+
         try:
             # Sort streams by resolution and rank (highest first) using simple, fast sorting
             sorted_streams = sort_streams_by_quality(item.streams)
-
-            tried_streams = 0
 
             for stream in sorted_streams:
                 stream_hit_circuit_breaker = False
@@ -261,6 +263,18 @@ class Downloader(Runner[None, DownloaderBase]):
                 logger.debug(
                     f"Failed to download any streams for {item.log_string} ({item.id})"
                 )
+
+                # Every failed stream above was blacklisted on the item, but the
+                # caller only commits when a RunnerResult is yielded
+                # (db_functions.run_thread_with_db_item). Falling through without
+                # yielding rolls those blacklists back, so the same dead streams
+                # are retried forever and the item never changes state.
+                #
+                # Guarded on tried_streams: with no streams there is nothing to
+                # persist, and yielding would re-queue the item into a
+                # downloader/scraper ping-pong.
+                if tried_streams > 0:
+                    yield RunnerResult(media_items=[item])
         else:
             # Clear service cooldowns on successful download
             self._service_cooldowns.clear()

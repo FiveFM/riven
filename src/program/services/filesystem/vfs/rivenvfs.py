@@ -223,6 +223,12 @@ class RivenVFS(pyfuse3.Operations):
             while not self._unmount_requested.value:
                 logger.trace("Starting FUSE main loop")
 
+                # Clear stale state from the previous run so dead MediaStream objects
+                # and file-handle entries don't accumulate across restarts.
+                self._active_streams.clear()
+                self._file_handles.clear()
+                self._next_fh = pyfuse3.FileHandleT(1)
+
                 try:
                     # pyfuse3.main is a coroutine that needs to run in its own trio event loop
                     trio.run(_async_main)
@@ -550,6 +556,10 @@ class RivenVFS(pyfuse3.Operations):
             self._register_filesystem_entry(subtitle, video_paths=video_paths)
             subtitle.available_in_vfs = True
 
+        # Flush parent-directory cache entries immediately so the kernel (and Plex)
+        # sees the new file without waiting for the 300-second entry_timeout to expire.
+        self._flush_pending_invalidations()
+
         return True
 
     def remove(self, item: MediaItem) -> bool:
@@ -618,10 +628,15 @@ class RivenVFS(pyfuse3.Operations):
 
             self._unmount_requested.value = True
 
-        trio.from_thread.run(
-            _request_unmount,
-            trio_token=pyfuse3.trio_token,
-        )
+        try:
+            trio.from_thread.run(
+                _request_unmount,
+                trio_token=pyfuse3.trio_token,
+            )
+        except Exception:
+            # The trio event loop may already be dead (e.g. after a crash).
+            # Set the flag directly so the _fuse_runner while-loop can exit.
+            self._unmount_requested.value = True
 
     # Helper methods
 
@@ -681,22 +696,28 @@ class RivenVFS(pyfuse3.Operations):
         if not self.mounted:
             return
 
+        # pyfuse3.close() can block indefinitely if the kernel FUSE fd is stuck.
+        # Run it in a daemon thread so we can move on after a timeout.
         try:
-            # Close FUSE session after main loop has exited
-            pyfuse3.close(unmount=True)
+            t = threading.Thread(target=lambda: pyfuse3.close(unmount=True), daemon=True)
+            t.start()
+            t.join(timeout=5.0)
+            if t.is_alive():
+                logger.warning("pyfuse3.close() did not complete in 5s, forcing unmount")
         except Exception:
             logger.exception("Error closing FUSE session")
 
-        # Force unmount if necessary
-        try:
-            subprocess.run(
-                ["fusermount", "-u", mountpoint],
-                capture_output=True,
-                timeout=10,
-                check=False,
-            )
-        except Exception:
-            pass
+        # Force lazy unmount so open Plex file handles don't block us
+        for cmd in (
+            ["fusermount3", "-u", "-z", mountpoint],
+            ["fusermount", "-u", "-z", mountpoint],
+            ["umount", "-l", mountpoint],
+        ):
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=10, check=False)
+                break
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                continue
 
     async def _terminate_async(self) -> None:
         """Async helper to call pyfuse3.terminate() within the Trio loop."""
@@ -1088,6 +1109,27 @@ class RivenVFS(pyfuse3.Operations):
         else:
             logger.warning(f"Unknown FilesystemEntry type: {type(entry)}")
             return []
+
+    def _flush_pending_invalidations(self) -> None:
+        """
+        Immediately push all accumulated parent-inode invalidations to the kernel.
+
+        Called after individual add() operations so that the kernel dentry cache for
+        parent directories is evicted right away, letting Plex see new files without
+        waiting for the 300-second entry_timeout to expire.
+        """
+        if not self.mounted or not self._pending_invalidations:
+            self._pending_invalidations.clear()
+            return
+
+        for inode in self._pending_invalidations:
+            try:
+                pyfuse3.invalidate_inode(inode, attr_only=False)
+            except OSError as e:
+                if e.errno != errno.ENOENT:
+                    logger.trace(f"Could not invalidate inode {inode}: {e}")
+
+        self._pending_invalidations.clear()
 
     def _register_clean_path(
         self,
